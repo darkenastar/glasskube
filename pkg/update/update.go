@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/glasskube/glasskube/api/v1alpha1"
 	"github.com/glasskube/glasskube/internal/cliutils"
@@ -26,6 +27,7 @@ type UpdateTransaction struct {
 	Items         []updateTransactionItem
 	ConflictItems []updateTransactionItemConflict
 	Requirements  []dependency.Requirement
+	Pruned        []dependency.Requirement
 }
 
 func (tx UpdateTransaction) IsEmpty() bool {
@@ -91,11 +93,12 @@ func (c *updater) PrepareForVersion(
 	if err := c.repoClient.ForPackage(pkg).
 		FetchPackageManifest(pkg.GetSpec().PackageInfo.Name, pkgVersion, &manifest); err != nil {
 		return nil, err
-	} else if result, err := c.dm.Validate(ctx, &manifest, pkgVersion); err != nil {
+	} else if result, err := c.dm.Validate(ctx, pkg.GetName(), pkg.GetNamespace(), &manifest, pkgVersion); err != nil {
 		return nil, err
 	} else if len(result.Conflicts) > 0 {
 		tx.ConflictItems = append(tx.ConflictItems, updateTransactionItemConflict{item, result.Conflicts})
 	} else {
+		tx.Pruned = result.Pruned
 		tx.Items = append(tx.Items, item)
 	}
 
@@ -125,6 +128,7 @@ func (c *updater) prepare(
 	c.status.SetStatus("Updating package index")
 
 	requirementsSet := make(map[dependency.Requirement]struct{})
+	var prunedSet *map[dependency.Requirement]struct{} // contains packages that should be pruned in all packagesToUpdate
 	var tx UpdateTransaction
 
 outer:
@@ -144,7 +148,8 @@ outer:
 						pkg.GetSpec().PackageInfo.Name, indexItem.LatestVersion, &manifest); err != nil {
 						return nil, err
 					}
-					if result, err := c.dm.Validate(ctx, &manifest, indexItem.LatestVersion); err != nil {
+					if result, err := c.dm.Validate(ctx, pkg.GetName(), pkg.GetNamespace(),
+						&manifest, indexItem.LatestVersion); err != nil {
 						return nil, err
 					} else if len(result.Conflicts) > 0 {
 						// This package can't be updated due to conflicts
@@ -155,6 +160,22 @@ outer:
 						for _, req := range result.Requirements {
 							requirementsSet[req] = struct{}{}
 						}
+						if prunedSet == nil {
+							// initialize on first iteration, in all other iterations it can at most shrink
+							p := make(map[dependency.Requirement]struct{})
+							prunedSet = &p
+							for _, req := range result.Pruned {
+								(*prunedSet)[req] = struct{}{}
+							}
+						} else {
+							// all other iterations can at most delete stuff from prunedSet
+							for req := range *prunedSet {
+								if !slices.Contains(result.Pruned, req) {
+									delete(*prunedSet, req)
+								}
+							}
+						}
+
 						// this package should be updated
 						tx.Items = append(tx.Items, item)
 					}
@@ -171,6 +192,11 @@ outer:
 
 	for req := range requirementsSet {
 		tx.Requirements = append(tx.Requirements, req)
+	}
+	if prunedSet != nil {
+		for req := range *prunedSet {
+			tx.Pruned = append(tx.Pruned, req)
+		}
 	}
 
 	return &tx, nil
@@ -256,7 +282,8 @@ func (c *updater) await(watcher watch.Interface, pkg ctrlpkg.Package) error {
 			if condition := meta.FindStatusCondition(
 				eventPkg.GetStatus().Conditions, string(condition.Ready)); condition != nil {
 				if condition.Status == metav1.ConditionFalse {
-					return fmt.Errorf("Package is not ready (reason %v): %v", condition.Reason, condition.Message)
+					return fmt.Errorf("%vackage is not ready (reason %v): %v",
+						pkg.GroupVersionKind().Kind, condition.Reason, condition.Message)
 				}
 			}
 		}

@@ -4,11 +4,11 @@ on:
   push:
     branches:
       - main
-      - "[0-9]+.[0-9]+.x"
+      - '[0-9]+.[0-9]+.x'
     tags:
-      - "v?[0-9]+.[0-9]+.[0-9]+-alpha.[0-9]+"
-      - "v?[0-9]+.[0-9]+.[0-9]+-beta.[0-9]+"
-      - "v?[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"
+      - 'v?[0-9]+.[0-9]+.[0-9]+-alpha.[0-9]+'
+      - 'v?[0-9]+.[0-9]+.[0-9]+-beta.[0-9]+'
+      - 'v?[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
   workflow_dispatch:
 
 jobs:
@@ -22,10 +22,10 @@ jobs:
       tag_name: ${{ steps.release-please.outputs.tag_name }}
     steps:
       - name: Checkout
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - name: Release Please
         id: release-please
-        uses: googleapis/release-please-action@7987652d64b4581673a76e33ad5e98e3dd56832f # v4.1.3
+        uses: googleapis/release-please-action@a02a34c4d625f9be7cb89156071d8567266a2445 # v4.2.0
         with:
           token: ${{ secrets.GLASSKUBE_BOT_SECRET }}
 
@@ -38,11 +38,11 @@ jobs:
     if: ${{ needs.release-please.outputs.releases_created == 'true' || startsWith(github.ref, 'refs/tags/') }}
     steps:
       - name: Checkout
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
           fetch-depth: 0
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
         with:
           registry: ghcr.io
           username: glasskube-bot
@@ -52,24 +52,40 @@ jobs:
         with:
           platforms: amd64,arm64
       - name: Set up Go
-        uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5
+        uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b # v5
         with:
-          go-version: "1.22.x"
+          go-version: '1.23.x'
       - name: Set up node
-        uses: actions/setup-node@1e60f620b9541d16bece96c5465dc8ee9832be0b # v4.0.3
+        uses: actions/setup-node@cdca7365b2dadb8aad0a33bc7601856ffabcc48e # v4.3.0
         with:
-          node-version: "20.9"
+          node-version: '22.14'
           cache: npm
       - name: Install dependencies
-        run: npm ci
+        run: npm i
       - name: Set up kubectl
         uses: azure/setup-kubectl@3e0aec4d80787158d308d7b364cb1b702e7feb7f # v4
         with:
-          version: "v1.29.1"
+          version: 'v1.29.1'
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@286f3b13b1b49da4ac219696163fb8c1c93e1200 # v6
+        uses: goreleaser/goreleaser-action@9c156ee8a17a598857849441385a2041ef570552 # v6
         with:
           version: latest
           args: release
         env:
           GITHUB_TOKEN: ${{ secrets.GLASSKUBE_BOT_SECRET }}
+      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4
+        with:
+          aws-access-key-id: ${{ secrets.WEBSITE_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.WEBSITE_AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-central-1
+      - name: Upload schemas to website
+        run: >-
+          aws s3 sync schemas s3://glasskube.dev/schemas/
+          --cache-control "max-age=60, public"
+          --acl=public-read
+      - name: Upload release.json to website
+        run: >-
+          aws s3 cp release.json s3://glasskube.dev/release.json
+          --cache-control "max-age=60, public"
+          --acl=public-read
+

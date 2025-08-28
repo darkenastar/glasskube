@@ -9,6 +9,7 @@ import (
 
 	"github.com/glasskube/glasskube/api/v1alpha1"
 	"github.com/glasskube/glasskube/internal/cliutils"
+	"github.com/glasskube/glasskube/internal/maputils"
 	"github.com/glasskube/glasskube/internal/names"
 	repoclient "github.com/glasskube/glasskube/internal/repo/client"
 	repotypes "github.com/glasskube/glasskube/internal/repo/types"
@@ -33,6 +34,9 @@ type ListOptions struct {
 	IncludePackageInfos bool
 	OnlyInstalled       bool
 	OnlyOutdated        bool
+	Repository          string
+	PackageName         string
+	Namespace           string
 }
 
 type lister struct {
@@ -101,7 +105,9 @@ func (l *lister) GetPackagesWithStatus(
 			}
 		}
 		hasIncludedItems := len(ls) > 0
-		if hasIncludedItems || (!options.OnlyInstalled && !options.OnlyOutdated) {
+		if hasIncludedItems ||
+			(!options.OnlyInstalled && !options.OnlyOutdated && options.Namespace == "" &&
+				(item.IndexItem.Name == options.PackageName || options.PackageName == "")) {
 			result = append(result, &PackagesWithStatus{
 				MetaIndexItem: *item.IndexItem,
 				Packages:      ls,
@@ -118,10 +124,13 @@ func clusterPackageShouldBeIncluded(item *result, options ListOptions) bool {
 
 func packageShouldBeIncluded(item *result, pkg *v1alpha1.Package, options ListOptions) bool {
 	if pkg != nil {
-		if !options.OnlyOutdated {
-			return true
+		if options.PackageName != "" && pkg.Spec.PackageInfo.Name != options.PackageName {
+			return false
 		}
-		return item.IndexItem != nil && pkg.Spec.PackageInfo.Version != item.IndexItem.LatestVersion
+		if options.OnlyOutdated && (item.IndexItem != nil && pkg.Spec.PackageInfo.Version == item.IndexItem.LatestVersion) {
+			return false
+		}
+		return true
 	}
 	return false
 }
@@ -149,8 +158,8 @@ func (l *lister) fetchRepoAndInstalled(ctx context.Context, options ListOptions,
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := l.repoClient.Meta().FetchMetaIndex(&index); err != nil {
-				repoErr = fmt.Errorf("could not fetch package repository index: %w", err)
+			if err := l.fetchMetaIndex(options, &index); err != nil {
+				repoErr = err
 			}
 			l.cachedIndex = &index
 		}()
@@ -172,7 +181,7 @@ func (l *lister) fetchRepoAndInstalled(ctx context.Context, options ListOptions,
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := l.pkgClient.Packages("").GetAll(ctx, &packages); err != nil {
+			if err := l.pkgClient.Packages(options.Namespace).GetAll(ctx, &packages); err != nil {
 				pkgErr = fmt.Errorf("could not fetch installed packages: %w", err)
 			}
 		}()
@@ -234,4 +243,41 @@ func setPackageInfo(packageInfos v1alpha1.PackageInfoList, res *result, pkg ctrl
 			break
 		}
 	}
+}
+
+func (l *lister) fetchMetaIndex(options ListOptions, index *repotypes.MetaIndex) error {
+	if options.Repository == "" {
+		if err := l.repoClient.Meta().FetchMetaIndex(index); err != nil {
+			return fmt.Errorf("could not fetch package repository index: %w", err)
+		}
+		return nil
+	}
+	// fetch index for given repo
+	var repoIndex repotypes.PackageRepoIndex
+	err := l.repoClient.ForRepoWithName(options.Repository).FetchPackageRepoIndex(&repoIndex)
+	if err != nil {
+		return fmt.Errorf("could not fetch package repository index for repo %s: %w",
+			options.Repository,
+			err)
+	}
+	*index = repoIndexToMetaIndex(options.Repository, repoIndex)
+	return nil
+}
+
+func repoIndexToMetaIndex(repo string, index repotypes.PackageRepoIndex) repotypes.MetaIndex {
+	indexMap := make(map[string]repotypes.MetaIndexItem)
+	for _, item := range index.Packages {
+		indexMap[item.Name] = repotypes.MetaIndexItem{
+			PackageRepoIndexItem: item,
+			Repos:                []string{repo},
+		}
+	}
+
+	metaIndex := repotypes.MetaIndex{
+		Packages: make([]repotypes.MetaIndexItem, len(indexMap)),
+	}
+	for i, name := range maputils.KeysSorted(indexMap) {
+		metaIndex.Packages[i] = indexMap[name]
+	}
+	return metaIndex
 }

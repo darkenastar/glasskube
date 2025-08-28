@@ -14,11 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-var fakeRepo = &fake.FakeClient{
-	PackageRepositories: []v1alpha1.PackageRepository{
-		{},
-	},
-}
+var fakeRepo = fake.EmptyClient()
 
 type testClientAdapter struct {
 	clusterPackages []v1alpha1.ClusterPackage
@@ -66,7 +62,7 @@ func (a *testClientAdapter) ListPackageRepositories(ctx context.Context) (*v1alp
 
 func createDependencyManager() *DependendcyManager {
 	testClient = &testClientAdapter{}
-	return NewDependencyManager(testClient, &fake.FakeClientset{Client: fakeRepo})
+	return NewDependencyManager(testClient, fake.ClientsetWithClient(fakeRepo))
 }
 
 var testClient *testClientAdapter
@@ -80,13 +76,14 @@ var dm *DependendcyManager
 var d, e, p, x, y *v1alpha1.ClusterPackage
 
 // Package n (name "N") is a namespace-scoped package that depends on E
+// Package c (name "C") is a component of another package
 var n *v1alpha1.Package
 
 // di, ei, pi, xi, yi, ni are the corresponding PackageInfo's to the package d, p, x, y, n
 var di, ei, pi, xi, yi, ni *v1alpha1.PackageInfo
 
 func createClusterPackageAndInfo(
-	name, version string, installed bool) (*v1alpha1.ClusterPackage, *v1alpha1.PackageInfo) {
+	name, version string, installed bool, installedAsDep bool) (*v1alpha1.ClusterPackage, *v1alpha1.PackageInfo) {
 
 	manifest := v1alpha1.PackageManifest{
 		Name: name,
@@ -97,6 +94,7 @@ func createClusterPackageAndInfo(
 		Spec:       v1alpha1.PackageSpec{PackageInfo: v1alpha1.PackageInfoTemplate{Name: name, Version: version}},
 		Status:     v1alpha1.PackageStatus{OwnedPackageInfos: []v1alpha1.OwnedResourceRef{{Name: name}}},
 	}
+	pkg.SetInstalledAsDependency(installedAsDep)
 	pkgi := v1alpha1.PackageInfo{
 		ObjectMeta: metav1.ObjectMeta{Name: names.PackageInfoName(&pkg)},
 		Spec:       v1alpha1.PackageInfoSpec{Name: name, Version: version},
@@ -110,17 +108,18 @@ func createClusterPackageAndInfo(
 }
 
 func createPackageAndInfo(
-	name, namespace, version string, installed bool) (*v1alpha1.Package, *v1alpha1.PackageInfo) {
+	name, installedName, namespace, version string, installed bool, installedAsDep bool) (*v1alpha1.Package, *v1alpha1.PackageInfo) {
 
 	manifest := v1alpha1.PackageManifest{
 		Name: name,
 	}
 	fakeRepo.AddPackage(name, version, &manifest)
 	pkg := v1alpha1.Package{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: installedName, Namespace: namespace},
 		Spec:       v1alpha1.PackageSpec{PackageInfo: v1alpha1.PackageInfoTemplate{Name: name, Version: version}},
 		Status:     v1alpha1.PackageStatus{OwnedPackageInfos: []v1alpha1.OwnedResourceRef{{Name: name}}},
 	}
+	pkg.SetInstalledAsDependency(installedAsDep)
 	pkgi := v1alpha1.PackageInfo{
 		ObjectMeta: metav1.ObjectMeta{Name: names.PackageInfoName(&pkg)},
 		Spec:       v1alpha1.PackageInfoSpec{Name: name, Version: version},
@@ -137,7 +136,7 @@ var _ = Describe("Dependency Manager", func() {
 
 	BeforeEach(func() {
 		dm = createDependencyManager()
-		p, pi = createClusterPackageAndInfo("P", "12.2.0", false)
+		p, pi = createClusterPackageAndInfo("P", "12.2.0", false, false)
 	})
 
 	AfterEach(func() {
@@ -161,12 +160,13 @@ var _ = Describe("Dependency Manager", func() {
 
 		When("P has no dependencies", func() {
 			It("should return OK", func(ctx context.Context) {
-				res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+				res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 				Expect(err).ShouldNot(HaveOccurred())
 				Expect(res).ShouldNot(BeNil())
 				Expect(res.Status).Should(Equal(ValidationResultStatusOk))
 				Expect(res.Requirements).Should(BeEmpty())
 				Expect(res.Conflicts).Should(BeEmpty())
+				Expect(res.Pruned).Should(BeEmpty())
 			})
 		})
 
@@ -183,28 +183,29 @@ var _ = Describe("Dependency Manager", func() {
 				When("D exists", func() {
 
 					BeforeEach(func() {
-						d, di = createClusterPackageAndInfo("D", "1.1.1", true)
+						d, di = createClusterPackageAndInfo("D", "1.1.1", true, false)
 					})
 
 					When("no other package dependent on D", func() {
 						It("should return OK", func(ctx context.Context) {
-							res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+							res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 							Expect(err).ShouldNot(HaveOccurred())
 							Expect(res).ShouldNot(BeNil())
 							Expect(res.Status).Should(Equal(ValidationResultStatusOk))
 							Expect(res.Requirements).Should(BeEmpty())
 							Expect(res.Conflicts).Should(BeEmpty())
+							Expect(res.Pruned).Should(BeEmpty())
 						})
 					})
 
 					When("other existing packages X, Y dependent on D", func() {
 
 						BeforeEach(func() {
-							x, xi = createClusterPackageAndInfo("X", "0.17.2", true)
+							x, xi = createClusterPackageAndInfo("X", "0.17.2", true, false)
 							xi.Status.Manifest.Dependencies = []v1alpha1.Dependency{{
 								Name: "D",
 							}}
-							y, yi = createClusterPackageAndInfo("Y", "3.2.0-beta.7", true)
+							y, yi = createClusterPackageAndInfo("Y", "3.2.0-beta.7", true, false)
 							yi.Status.Manifest.Dependencies = []v1alpha1.Dependency{{
 								Name: "D",
 							}}
@@ -212,36 +213,39 @@ var _ = Describe("Dependency Manager", func() {
 
 						When("X and Y require no version range of D", func() {
 							It("should return OK", func(ctx context.Context) {
-								res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+								res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 								Expect(err).ShouldNot(HaveOccurred())
 								Expect(res).ShouldNot(BeNil())
 								Expect(res.Status).Should(Equal(ValidationResultStatusOk))
 								Expect(res.Requirements).Should(BeEmpty())
 								Expect(res.Conflicts).Should(BeEmpty())
+								Expect(res.Pruned).Should(BeEmpty())
 							})
 						})
 
 						When("X requires D in version range", func() {
 							It("should return OK", func(ctx context.Context) {
 								xi.Status.Manifest.Dependencies[0].Version = ">= 1, < 2"
-								res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+								res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 								Expect(err).ShouldNot(HaveOccurred())
 								Expect(res).ShouldNot(BeNil())
 								Expect(res.Status).Should(Equal(ValidationResultStatusOk))
 								Expect(res.Requirements).Should(BeEmpty())
 								Expect(res.Conflicts).Should(BeEmpty())
+								Expect(res.Pruned).Should(BeEmpty())
 							})
 						})
 
 						When("Y requires D in version range", func() {
 							It("should return OK", func(ctx context.Context) {
 								yi.Status.Manifest.Dependencies[0].Version = "1.x.x"
-								res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+								res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 								Expect(err).ShouldNot(HaveOccurred())
 								Expect(res).ShouldNot(BeNil())
 								Expect(res.Status).Should(Equal(ValidationResultStatusOk))
 								Expect(res.Requirements).Should(BeEmpty())
 								Expect(res.Conflicts).Should(BeEmpty())
+								Expect(res.Pruned).Should(BeEmpty())
 							})
 						})
 
@@ -249,12 +253,13 @@ var _ = Describe("Dependency Manager", func() {
 							It("should return OK", func(ctx context.Context) {
 								xi.Status.Manifest.Dependencies[0].Version = ">= 1, < 2"
 								yi.Status.Manifest.Dependencies[0].Version = "1.x.x"
-								res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+								res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 								Expect(err).ShouldNot(HaveOccurred())
 								Expect(res).ShouldNot(BeNil())
 								Expect(res.Status).Should(Equal(ValidationResultStatusOk))
 								Expect(res.Requirements).Should(BeEmpty())
 								Expect(res.Conflicts).Should(BeEmpty())
+								Expect(res.Pruned).Should(BeEmpty())
 							})
 						})
 					})
@@ -265,7 +270,7 @@ var _ = Describe("Dependency Manager", func() {
 						fakeRepo.AddPackage("D", "1.1.7", &v1alpha1.PackageManifest{Name: "D"})
 					})
 					It("should return a RESOLVABLE result with D in latest", func(ctx context.Context) {
-						res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+						res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 						Expect(err).ShouldNot(HaveOccurred())
 						Expect(res).ShouldNot(BeNil())
 						Expect(res.Status).Should(Equal(ValidationResultStatusResolvable))
@@ -273,6 +278,7 @@ var _ = Describe("Dependency Manager", func() {
 						Expect(res.Requirements[0].Name).Should(Equal("D"))
 						Expect(res.Requirements[0].Version).Should(Equal("1.1.7"))
 						Expect(res.Conflicts).Should(BeEmpty())
+						Expect(res.Pruned).Should(BeEmpty())
 					})
 				})
 			})
@@ -292,12 +298,12 @@ var _ = Describe("Dependency Manager", func() {
 						When("there is no other existing package dependent on D", func() {
 
 							BeforeEach(func() {
-								x, xi = createClusterPackageAndInfo("X", "0.17.0", true) // X here has no dependency on D
+								x, xi = createClusterPackageAndInfo("X", "0.17.0", true, false) // X here has no dependency on D
 							})
 
 							It("should return OK if D's version is in required range", func(ctx context.Context) {
-								d, di = createClusterPackageAndInfo("D", "1.3.0", true)
-								res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+								d, di = createClusterPackageAndInfo("D", "1.3.0", true, false)
+								res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 								Expect(err).ShouldNot(HaveOccurred())
 								Expect(res).ShouldNot(BeNil())
 								Expect(res.Status).Should(Equal(ValidationResultStatusOk))
@@ -306,8 +312,8 @@ var _ = Describe("Dependency Manager", func() {
 							})
 
 							It("should return CONFLICT if D's version is too old", func(ctx context.Context) {
-								d, di = createClusterPackageAndInfo("D", "1.2.1", true)
-								res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+								d, di = createClusterPackageAndInfo("D", "1.2.1", true, false)
+								res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 								Expect(err).ShouldNot(HaveOccurred())
 								Expect(res).ShouldNot(BeNil())
 								Expect(res.Status).Should(Equal(ValidationResultStatusConflict))
@@ -321,8 +327,8 @@ var _ = Describe("Dependency Manager", func() {
 							})
 
 							It("should return CONFLICT if D's version is too new", func(ctx context.Context) {
-								d, di = createClusterPackageAndInfo("D", "2.0.0-alpha.2", true)
-								res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+								d, di = createClusterPackageAndInfo("D", "2.0.0-alpha.2", true, false)
+								res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 								Expect(err).ShouldNot(HaveOccurred())
 								Expect(res).ShouldNot(BeNil())
 								Expect(res.Status).Should(Equal(ValidationResultStatusConflict))
@@ -339,11 +345,11 @@ var _ = Describe("Dependency Manager", func() {
 						When("existing packages X and Y are dependent on D but require no version range of D", func() {
 
 							BeforeEach(func() {
-								x, xi = createClusterPackageAndInfo("X", "0.17.3", true)
+								x, xi = createClusterPackageAndInfo("X", "0.17.3", true, false)
 								xi.Status.Manifest.Dependencies = []v1alpha1.Dependency{{
 									Name: "D",
 								}}
-								y, yi = createClusterPackageAndInfo("Y", "3.2.0-beta.8", true)
+								y, yi = createClusterPackageAndInfo("Y", "3.2.0-beta.8", true, false)
 								yi.Status.Manifest.Dependencies = []v1alpha1.Dependency{{
 									Name: "D",
 								}}
@@ -352,8 +358,8 @@ var _ = Describe("Dependency Manager", func() {
 							// these are the same tests as in the previous When("there is no other existing package dependent on D")
 
 							It("should return OK if D's version is in required range", func(ctx context.Context) {
-								d, di = createClusterPackageAndInfo("D", "1.3.1", true)
-								res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+								d, di = createClusterPackageAndInfo("D", "1.3.1", true, false)
+								res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 								Expect(err).ShouldNot(HaveOccurred())
 								Expect(res).ShouldNot(BeNil())
 								Expect(res.Status).Should(Equal(ValidationResultStatusOk))
@@ -362,8 +368,8 @@ var _ = Describe("Dependency Manager", func() {
 							})
 
 							It("should return CONFLICT if D's version is too old", func(ctx context.Context) {
-								d, di = createClusterPackageAndInfo("D", "1.1.7", true)
-								res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+								d, di = createClusterPackageAndInfo("D", "1.1.7", true, false)
+								res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 								Expect(err).ShouldNot(HaveOccurred())
 								Expect(res).ShouldNot(BeNil())
 								Expect(res.Status).Should(Equal(ValidationResultStatusConflict))
@@ -377,8 +383,8 @@ var _ = Describe("Dependency Manager", func() {
 							})
 
 							It("should return CONFLICT if D's version is too new", func(ctx context.Context) {
-								d, di = createClusterPackageAndInfo("D", "2.0.0-alpha.2", true)
-								res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+								d, di = createClusterPackageAndInfo("D", "2.0.0-alpha.2", true, false)
+								res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 								Expect(err).ShouldNot(HaveOccurred())
 								Expect(res).ShouldNot(BeNil())
 								Expect(res.Status).Should(Equal(ValidationResultStatusConflict))
@@ -396,12 +402,12 @@ var _ = Describe("Dependency Manager", func() {
 					When("other existing packages X, Y are dependent on D and require D in version ranges", func() {
 
 						BeforeEach(func() {
-							x, xi = createClusterPackageAndInfo("X", "0.18.3", true)
+							x, xi = createClusterPackageAndInfo("X", "0.18.3", true, false)
 							xi.Status.Manifest.Dependencies = []v1alpha1.Dependency{{
 								Name:    "D",
 								Version: "^1.0.0 || 2.0.0",
 							}}
-							y, yi = createClusterPackageAndInfo("X", "3.3.3", true)
+							y, yi = createClusterPackageAndInfo("X", "3.3.3", true, false)
 							yi.Status.Manifest.Dependencies = []v1alpha1.Dependency{{
 								Name:    "D",
 								Version: ">= 1.1.0, < 3",
@@ -409,8 +415,8 @@ var _ = Describe("Dependency Manager", func() {
 						})
 
 						It("should return OK if D's version is in required range", func(ctx context.Context) {
-							d, di = createClusterPackageAndInfo("D", "1.4.0", true)
-							res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+							d, di = createClusterPackageAndInfo("D", "1.4.0", true, false)
+							res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 							Expect(err).ShouldNot(HaveOccurred())
 							Expect(res).ShouldNot(BeNil())
 							Expect(res.Status).Should(Equal(ValidationResultStatusOk))
@@ -419,8 +425,8 @@ var _ = Describe("Dependency Manager", func() {
 						})
 
 						It("should return CONFLICT if D's version is too old", func(ctx context.Context) {
-							d, di = createClusterPackageAndInfo("D", "1.2.1", true)
-							res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+							d, di = createClusterPackageAndInfo("D", "1.2.1", true, false)
+							res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 							Expect(err).ShouldNot(HaveOccurred())
 							Expect(res).ShouldNot(BeNil())
 							Expect(res.Status).Should(Equal(ValidationResultStatusConflict))
@@ -434,8 +440,8 @@ var _ = Describe("Dependency Manager", func() {
 						})
 
 						It("should return CONFLICT if D's version is too new", func(ctx context.Context) {
-							d, di = createClusterPackageAndInfo("D", "2.0.0", true)
-							res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+							d, di = createClusterPackageAndInfo("D", "2.0.0", true, false)
+							res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 							Expect(err).ShouldNot(HaveOccurred())
 							Expect(res).ShouldNot(BeNil())
 							Expect(res.Status).Should(Equal(ValidationResultStatusConflict))
@@ -456,7 +462,7 @@ var _ = Describe("Dependency Manager", func() {
 					})
 
 					It("should return a RESOLVABLE result with latest D", func(ctx context.Context) {
-						res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+						res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 						Expect(err).ShouldNot(HaveOccurred())
 						Expect(res).ShouldNot(BeNil())
 						Expect(res.Status).Should(Equal(ValidationResultStatusResolvable))
@@ -464,6 +470,7 @@ var _ = Describe("Dependency Manager", func() {
 						Expect(res.Requirements[0].Name).Should(Equal("D"))
 						Expect(res.Requirements[0].Version).Should(Equal("1.7.4"))
 						Expect(res.Conflicts).Should(BeEmpty())
+						Expect(res.Pruned).Should(BeEmpty())
 					})
 				})
 			})
@@ -484,14 +491,15 @@ var _ = Describe("Dependency Manager", func() {
 			When("P requires no version ranges of D and E", func() {
 				When("D, E exist", func() {
 					It("Should return OK", func(ctx context.Context) {
-						d, di = createClusterPackageAndInfo("D", "118.0.0", true)
-						e, ei = createClusterPackageAndInfo("E", "11.80.0", true)
-						res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+						d, di = createClusterPackageAndInfo("D", "118.0.0", true, false)
+						e, ei = createClusterPackageAndInfo("E", "11.80.0", true, false)
+						res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 						Expect(err).ShouldNot(HaveOccurred())
 						Expect(res).ShouldNot(BeNil())
 						Expect(res.Status).Should(Equal(ValidationResultStatusOk))
 						Expect(res.Requirements).Should(BeEmpty())
 						Expect(res.Conflicts).Should(BeEmpty())
+						Expect(res.Pruned).Should(BeEmpty())
 					})
 				})
 
@@ -502,7 +510,7 @@ var _ = Describe("Dependency Manager", func() {
 					})
 
 					It("Should return RESOLVABLE result with D, E as requirements", func(ctx context.Context) {
-						res, err := dm.Validate(ctx, pi.Status.Manifest, p.Spec.PackageInfo.Version)
+						res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, p.Spec.PackageInfo.Version)
 						Expect(err).ShouldNot(HaveOccurred())
 						Expect(res).ShouldNot(BeNil())
 						Expect(res.Status).Should(Equal(ValidationResultStatusResolvable))
@@ -512,6 +520,7 @@ var _ = Describe("Dependency Manager", func() {
 						Expect(res.Requirements[1].Name).Should(Equal("E"))
 						Expect(res.Requirements[1].Version).Should(Equal("1.1.7"))
 						Expect(res.Conflicts).Should(BeEmpty())
+						Expect(res.Pruned).Should(BeEmpty())
 					})
 				})
 
@@ -524,36 +533,196 @@ var _ = Describe("Dependency Manager", func() {
 
 		When("D is installed", func() {
 			BeforeEach(func() {
-				d, di = createClusterPackageAndInfo("D", "1.1.1", true)
+				d, di = createClusterPackageAndInfo("D", "1.1.1", true, false)
 			})
 			When("there is a namespaced package N that depends on D", func() {
 				BeforeEach(func() {
-					n, ni = createPackageAndInfo("N", "default", "1.0.0", true)
+					n, ni = createPackageAndInfo("N", "N", "default", "1.0.0", true, false)
 					ni.Status.Manifest.Dependencies = []v1alpha1.Dependency{{Name: d.Name}}
 				})
-				When("D depends on N with constraint", func() {
+				When("N depends on D with constraint", func() {
 					BeforeEach(func() {
 						ni.Status.Manifest.Dependencies = []v1alpha1.Dependency{{Name: d.Name, Version: "1.x.x"}}
 					})
 					It("should prevent illegal update of D", func(ctx context.Context) {
-						d, di = createClusterPackageAndInfo("D", "2.0.0", false)
-						res, err := dm.Validate(ctx, di.Status.Manifest, di.Spec.Version)
+						d, di = createClusterPackageAndInfo("D", "2.0.0", false, false)
+						res, err := dm.Validate(ctx, d.Name, d.Namespace, di.Status.Manifest, di.Spec.Version)
 						Expect(err).ShouldNot(HaveOccurred())
 						Expect(res).ShouldNot(BeNil())
 						Expect(res.Status).Should(Equal(ValidationResultStatusConflict))
 						Expect(res.Requirements).Should(BeEmpty())
 						Expect(res.Conflicts).Should(HaveLen(1))
+						Expect(res.Pruned).Should(BeEmpty())
 					})
 					It("should allow legal update of D", func(ctx context.Context) {
-						d, di = createClusterPackageAndInfo("D", "1.2.0", false)
-						res, err := dm.Validate(ctx, di.Status.Manifest, di.Spec.Version)
+						d, di = createClusterPackageAndInfo("D", "1.2.0", false, false)
+						res, err := dm.Validate(ctx, d.Name, d.Namespace, di.Status.Manifest, di.Spec.Version)
 						Expect(err).ShouldNot(HaveOccurred())
 						Expect(res).ShouldNot(BeNil())
 						Expect(res.Status).Should(Equal(ValidationResultStatusOk))
 						Expect(res.Requirements).Should(BeEmpty())
 						Expect(res.Conflicts).Should(BeEmpty())
+						Expect(res.Pruned).Should(BeEmpty())
 					})
 				})
+			})
+		})
+
+		When("Package N has component C", func() {
+			When("C is not installed", func() {
+				BeforeEach(func() {
+					n, ni = createPackageAndInfo("N", "N", "default", "1.0.0", false, false)
+					createPackageAndInfo("C", "N-foo", "default", "1.0.0", false, false)
+					ni.Status.Manifest.Components = []v1alpha1.Component{
+						{Name: "C", Version: "1.0.0", InstalledName: "foo"},
+					}
+				})
+
+				It("should return RESOLVABLE with requirement C", func(ctx context.Context) {
+					res, err := dm.Validate(ctx, n.Name, n.Namespace, ni.Status.Manifest, "1.0.0")
+					Expect(err).NotTo(HaveOccurred())
+					Expect(res).NotTo(BeNil())
+					Expect(res.Status).To(Equal(ValidationResultStatusResolvable))
+					Expect(res.Requirements).To(ConsistOf(
+						Requirement{
+							PackageWithVersion: PackageWithVersion{Name: "C", Version: "1.0.0"},
+							ComponentMetadata:  &ComponentMetadata{Name: "N-foo", Namespace: "default"},
+							Transitive:         false,
+						},
+					))
+					Expect(res.Conflicts).To(BeEmpty())
+					Expect(res.Pruned).Should(BeEmpty())
+				})
+			})
+
+			When("C is installed", func() {
+				BeforeEach(func() {
+					n, ni = createPackageAndInfo("N", "N", "default", "1.0.0", true, false)
+					createPackageAndInfo("C", "N-foo", "default", "1.1.0", true, false)
+					ni.Status.Manifest.Components = []v1alpha1.Component{
+						{Name: "C", Version: ">=1.0.0", InstalledName: "foo"},
+					}
+				})
+
+				When("installed version of C does not violate constraint in N", func() {
+					It("should return OK", func(ctx context.Context) {
+						updateManifest := ni.Status.Manifest.DeepCopy()
+						updateManifest.Components[0].Version = ">=1.1.0"
+						res, err := dm.Validate(ctx, n.Name, n.Namespace, updateManifest, "2.0.0")
+						Expect(err).NotTo(HaveOccurred())
+						Expect(res).NotTo(BeNil())
+						Expect(res.Status).To(Equal(ValidationResultStatusOk))
+						Expect(res.Requirements).To(BeEmpty())
+						Expect(res.Conflicts).To(BeEmpty())
+						Expect(res.Pruned).Should(BeEmpty())
+					})
+				})
+
+				When("installed version of C violates constraint in N", func() {
+					It("should return CONFLICT", func(ctx context.Context) {
+						updateManifest := ni.Status.Manifest.DeepCopy()
+						updateManifest.Components[0].Version = ">=1.2.0"
+						fakeRepo.AddPackage("C", "1.2.0", &v1alpha1.PackageManifest{Name: "C"})
+						res, err := dm.Validate(ctx, n.Name, n.Namespace, updateManifest, "2.0.0")
+						Expect(err).NotTo(HaveOccurred())
+						Expect(res).NotTo(BeNil())
+						Expect(res.Status).To(Equal(ValidationResultStatusConflict))
+						Expect(res.Requirements).To(BeEmpty())
+						Expect(res.Conflicts).To(HaveLen(1))
+						Expect(res.Pruned).Should(BeEmpty())
+					})
+				})
+			})
+		})
+
+		When("ClusterPackage P has component C", func() {
+			BeforeEach(func() {
+				_, pi = createClusterPackageAndInfo("P", "1.0.0", false, false)
+				createPackageAndInfo("C", "P-foo", "p-system", "1.0.0", false, false)
+				pi.Status.Manifest.Components = []v1alpha1.Component{
+					{Name: "C", Version: "1.0.0", InstalledName: "foo"},
+				}
+				pi.Status.Manifest.DefaultNamespace = "p-system"
+			})
+
+			It("should return RESOLVABLE with requirement C", func(ctx context.Context) {
+				res, err := dm.Validate(ctx, p.Name, p.Namespace, pi.Status.Manifest, "1.0.0")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(res).NotTo(BeNil())
+				Expect(res.Status).To(Equal(ValidationResultStatusResolvable))
+				Expect(res.Requirements).To(ConsistOf(
+					Requirement{
+						PackageWithVersion: PackageWithVersion{Name: "C", Version: "1.0.0"},
+						ComponentMetadata:  &ComponentMetadata{Name: "P-foo", Namespace: "p-system"},
+						Transitive:         false,
+					},
+				))
+				Expect(res.Conflicts).To(BeEmpty())
+				Expect(res.Pruned).Should(BeEmpty())
+			})
+		})
+
+		When("Package is updated", func() {
+			It("should return OK with pruned C", func(ctx context.Context) {
+				_, pi = createClusterPackageAndInfo("P", "1.0.0", true, false)
+				createClusterPackageAndInfo("C", "1.0.0", true, true)
+				pi.Status.Manifest.Dependencies = []v1alpha1.Dependency{
+					{Name: "C", Version: "1.0.0"},
+				}
+				pi.Status.Manifest.DefaultNamespace = "p-system"
+
+				updatedManifest := pi.Status.Manifest.DeepCopy()
+				updatedManifest.Dependencies = []v1alpha1.Dependency{}
+				res, err := dm.Validate(ctx, p.Name, p.Namespace, updatedManifest, "2.0.0")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(res).NotTo(BeNil())
+				Expect(res.Status).To(Equal(ValidationResultStatusOk))
+				Expect(res.Requirements).To(BeEmpty())
+				Expect(res.Conflicts).To(BeEmpty())
+				Expect(res.Pruned).Should(ConsistOf(
+					Requirement{
+						PackageWithVersion: PackageWithVersion{Name: "C", Version: ""},
+						ComponentMetadata:  nil,
+						Transitive:         false,
+					},
+				))
+			})
+
+			It("should return OK with pruned C and D", func(ctx context.Context) {
+				_, pi = createClusterPackageAndInfo("P", "1.0.0", true, false)
+				createClusterPackageAndInfo("C", "1.0.0", true, true)
+				pi.Status.Manifest.Dependencies = []v1alpha1.Dependency{
+					{Name: "C", Version: "1.0.0"},
+				}
+				createPackageAndInfo("D", "P-D", "D", "1.0.0", true, true)
+				pi.Status.Manifest.Components = []v1alpha1.Component{
+					{Name: "D"},
+				}
+
+				updatedManifest := pi.Status.Manifest.DeepCopy()
+				updatedManifest.Dependencies = []v1alpha1.Dependency{}
+				updatedManifest.Components = []v1alpha1.Component{}
+				res, err := dm.Validate(ctx, p.Name, p.Namespace, updatedManifest, "2.0.0")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(res).NotTo(BeNil())
+				Expect(res.Status).To(Equal(ValidationResultStatusOk))
+				Expect(res.Requirements).To(BeEmpty())
+				Expect(res.Conflicts).To(BeEmpty())
+				Expect(res.Pruned).Should(ConsistOf(
+					Requirement{
+						PackageWithVersion: PackageWithVersion{Name: "C", Version: ""},
+						ComponentMetadata:  nil,
+						Transitive:         false,
+					},
+					Requirement{
+						PackageWithVersion: PackageWithVersion{Name: "D", Version: ""},
+						ComponentMetadata: &ComponentMetadata{
+							Name:      "P-D",
+							Namespace: "D",
+						},
+						Transitive: false,
+					},
+				))
 			})
 		})
 	})

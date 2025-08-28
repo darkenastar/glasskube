@@ -8,19 +8,18 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"math/rand"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"slices"
 	"strconv"
-	"strings"
-	"sync"
 	"syscall"
 	"time"
 
-	"github.com/glasskube/glasskube/internal/web/components/toast"
+	"github.com/glasskube/glasskube/internal/web/handlers"
+	webopen "github.com/glasskube/glasskube/internal/web/open"
+	"github.com/glasskube/glasskube/internal/web/responder"
+	"github.com/glasskube/glasskube/internal/web/types"
 
 	"github.com/glasskube/glasskube/internal/web/sse"
 	"github.com/glasskube/glasskube/internal/web/sse/refresh"
@@ -29,37 +28,19 @@ import (
 
 	"github.com/glasskube/glasskube/internal/controller/ctrlpkg"
 
-	"github.com/glasskube/glasskube/internal/web/util"
-
-	"github.com/Masterminds/semver/v3"
 	"github.com/glasskube/glasskube/api/v1alpha1"
-	"github.com/glasskube/glasskube/internal/clientutils"
 	"github.com/glasskube/glasskube/internal/cliutils"
 	"github.com/glasskube/glasskube/internal/config"
-	"github.com/glasskube/glasskube/internal/dependency"
-	"github.com/glasskube/glasskube/internal/manifestvalues"
-	"github.com/glasskube/glasskube/internal/repo"
 	repoclient "github.com/glasskube/glasskube/internal/repo/client"
-	repotypes "github.com/glasskube/glasskube/internal/repo/types"
 	"github.com/glasskube/glasskube/internal/telemetry"
-	"github.com/glasskube/glasskube/internal/web/handler"
+	"github.com/glasskube/glasskube/internal/web/middleware"
 	"github.com/glasskube/glasskube/pkg/bootstrap"
 	"github.com/glasskube/glasskube/pkg/client"
-	"github.com/glasskube/glasskube/pkg/describe"
-	"github.com/glasskube/glasskube/pkg/install"
-	"github.com/glasskube/glasskube/pkg/list"
-	"github.com/glasskube/glasskube/pkg/manifest"
-	"github.com/glasskube/glasskube/pkg/open"
-	"github.com/glasskube/glasskube/pkg/uninstall"
-	"github.com/glasskube/glasskube/pkg/update"
-	"github.com/gorilla/mux"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
-	corev1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
@@ -74,8 +55,8 @@ var webFs fs.FS = embeddedFs
 
 func init() {
 	if config.IsDevBuild() {
-		if _, err := os.Lstat(templatesBaseDir); err == nil {
-			webFs = os.DirFS(templatesBaseDir)
+		if _, err := os.Lstat(responder.BaseDir); err == nil {
+			webFs = os.DirFS(responder.BaseDir)
 		}
 	}
 }
@@ -92,9 +73,6 @@ func NewServer(options ServerOptions) *server {
 	server := server{
 		ServerOptions:           options,
 		configLoader:            &defaultConfigLoader{options.Kubeconfig},
-		forwarders:              make(map[string]*open.OpenResult),
-		updateTransactions:      make(map[int]update.UpdateTransaction),
-		templates:               templates{},
 		stopCh:                  make(chan struct{}, 1),
 		httpServerHasShutdownCh: make(chan struct{}, 1),
 	}
@@ -111,17 +89,9 @@ type server struct {
 	nonCachedClient         client.PackageV1Alpha1Client
 	repoClientset           repoclient.RepoClientset
 	k8sClient               *kubernetes.Clientset
+	coreListers             *types.CoreListers
 	broadcaster             *sse.Broadcaster
-	namespaceLister         *corev1.NamespaceLister
-	configMapLister         *corev1.ConfigMapLister
-	secretLister            *corev1.SecretLister
-	forwarders              map[string]*open.OpenResult
-	dependencyMgr           *dependency.DependendcyManager
-	updateMutex             sync.Mutex
-	updateTransactions      map[int]update.UpdateTransaction
-	valueResolver           *manifestvalues.Resolver
 	isBootstrapped          bool
-	templates               templates
 	httpServer              *http.Server
 	httpServerHasShutdownCh chan struct{}
 	stopCh                  chan struct{}
@@ -141,6 +111,10 @@ func (s *server) Client() client.PackageV1Alpha1Client {
 
 func (s *server) K8sClient() *kubernetes.Clientset {
 	return s.k8sClient
+}
+
+func (s *server) CoreListers() *types.CoreListers {
+	return s.coreListers
 }
 
 func (s *server) RepoClient() repoclient.RepoClientset {
@@ -164,12 +138,9 @@ func (s *server) Start(ctx context.Context) error {
 		initLogging(5)
 	}
 
-	s.templates.parseTemplates()
-	if config.IsDevBuild() {
-		if err := s.templates.watchTemplates(); err != nil {
-			fmt.Fprintf(os.Stderr, "templates will not be parsed after changes: %v\n", err)
-		}
-	}
+	responder.Init(webFs)
+	webopen.Init(s.Host, s.stopCh)
+
 	s.broadcaster = sse.NewBroadcaster()
 	_ = s.ensureBootstrapped(ctx)
 
@@ -180,60 +151,78 @@ func (s *server) Start(ctx context.Context) error {
 
 	fileServer := http.FileServer(http.FS(root))
 
-	router := mux.NewRouter()
-	router.Use(telemetry.HttpMiddleware(telemetry.WithPathRedactor(packagesPathRedactor)))
-	router.PathPrefix("/static/").Handler(fileServer)
-	router.Handle("/favicon.ico", fileServer)
-	router.HandleFunc("/events", s.broadcaster.Handler)
-	router.HandleFunc("/support", s.supportPage)
-	router.HandleFunc("/kubeconfig", s.kubeconfigPage)
-	router.Handle("/bootstrap", s.requireKubeconfig(s.bootstrapPage))
-	router.Handle("/kubeconfig/persist", s.requireKubeconfig(s.persistKubeconfig))
-	// overview pages
-	router.Handle("/packages", s.requireReady(s.packages))
-	router.Handle("/clusterpackages", s.requireReady(s.clusterPackages))
+	router := http.NewServeMux()
+	router.Handle("GET /static/", fileServer)
+	router.Handle("GET /favicon.ico", fileServer)
 
-	// detail page endpoints
-	pkgBasePath := "/packages/{manifestName}"
-	installedPkgBasePath := pkgBasePath + "/{namespace}/{name}"
-	clpkgBasePath := "/clusterpackages/{pkgName}"
-	router.Handle(pkgBasePath, s.requireReady(s.packageDetail))
-	router.Handle(installedPkgBasePath, s.requireReady(s.packageDetail))
-	router.Handle(clpkgBasePath, s.requireReady(s.clusterPackageDetail))
-	// discussion endpoints
-	router.Handle(pkgBasePath+"/discussion", s.requireReady(s.packageDiscussion))
-	router.Handle(installedPkgBasePath+"/discussion", s.requireReady(s.packageDiscussion))
-	router.Handle(clpkgBasePath+"/discussion", s.requireReady(s.clusterPackageDiscussion))
-	router.Handle(pkgBasePath+"/discussion/badge", s.requireReady(s.discussionBadge))
-	router.Handle(installedPkgBasePath+"/discussion/badge", s.requireReady(s.discussionBadge))
-	router.Handle(clpkgBasePath+"/discussion/badge", s.requireReady(s.discussionBadge))
-	// configuration endpoints
-	router.Handle(installedPkgBasePath+"/configure", s.requireReady(s.installOrConfigurePackage))
-	router.Handle(clpkgBasePath+"/configure", s.requireReady(s.installOrConfigureClusterPackage))
-	router.Handle(installedPkgBasePath+"/configure/advanced", s.requireReady(s.advancedPackageConfiguration))
-	router.Handle(clpkgBasePath+"/configure/advanced", s.requireReady(s.advancedClusterPackageConfiguration))
-	router.Handle(pkgBasePath+"/configuration/{valueName}", s.requireReady(s.packageConfigurationInput))
-	router.Handle(installedPkgBasePath+"/configuration/{valueName}", s.requireReady(s.packageConfigurationInput))
-	router.Handle(clpkgBasePath+"/configuration/{valueName}", s.requireReady(s.clusterPackageConfigurationInput))
-	// update endpoints
-	router.Handle(installedPkgBasePath+"/update", s.requireReady(s.update))
-	router.Handle(clpkgBasePath+"/update", s.requireReady(s.update))
-	// open endpoints
-	router.Handle(installedPkgBasePath+"/open", s.requireReady(s.open))
-	router.Handle(clpkgBasePath+"/open", s.requireReady(s.open))
-	// uninstall endpoints
-	router.Handle(installedPkgBasePath+"/uninstall", s.requireReady(s.uninstall))
-	router.Handle(clpkgBasePath+"/uninstall", s.requireReady(s.uninstall))
+	router.HandleFunc("GET /events", s.broadcaster.Handler) // TODO ??
 
-	// configuration datalist endpoints
-	router.Handle("/datalists/{valueName}/names", s.requireReady(s.namesDatalist))
-	router.Handle("/datalists/{valueName}/keys", s.requireReady(s.keysDatalist))
 	// settings
-	router.Handle("/settings", s.requireReady(s.settingsPage))
-	router.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	router.Handle("GET /settings", s.requireReady(handlers.GetSettings))
+	router.Handle("POST /settings", s.requireReady(handlers.PostSettings))
+	router.Handle("GET /settings/repository/{repoName}", s.requireReady(handlers.GetRepository))
+	router.Handle("POST /settings/repository/{repoName}", s.requireReady(handlers.PostRepository))
+
+	// overview
+	router.Handle("GET /clusterpackages", s.requireReady(handlers.GetClusterPackages))
+	router.Handle("GET /packages", s.requireReady(handlers.GetPackages))
+
+	// package detail
+	router.Handle("GET /clusterpackages/{manifestName}", s.requireReady(handlers.GetClusterPackageDetail))
+	router.Handle("GET /packages/{manifestName}", s.requireReady(handlers.GetPackageDetail))
+	router.Handle("GET /packages/{manifestName}/{namespace}/{name}", s.requireReady(handlers.GetPackageDetail))
+
+	// installation/update + configuration
+	router.Handle("POST /clusterpackages/{manifestName}", s.requireReady(handlers.PostClusterPackageDetail))
+	router.Handle("POST /packages/{manifestName}/{namespace}/{name}", s.requireReady(handlers.PostPackageDetail))
+
+	// discussion
+	router.Handle("POST /giscus", s.requireReady(handlers.PostGiscus))
+	router.Handle("GET /clusterpackages/{manifestName}/discussion", s.requireReady(handlers.GetClusterPackageDiscussion))
+	router.Handle("GET /packages/{manifestName}/discussion", s.requireReady(handlers.GetPackageDiscussion))
+	router.Handle("GET /packages/{manifestName}/{namespace}/{name}/discussion", s.requireReady(handlers.GetPackageDiscussion))
+	router.Handle("GET /clusterpackages/{manifestName}/discussion/badge", s.requireReady(handlers.GetDiscussionBadge))
+	router.Handle("GET /packages/{manifestName}/discussion/badge", s.requireReady(handlers.GetDiscussionBadge))
+	router.Handle("GET /packages/{manifestName}/{namespace}/{name}/discussion/badge", s.requireReady(handlers.GetDiscussionBadge))
+
+	// configuration
+	router.Handle("GET /clusterpackages/{manifestName}/configuration/{valueName}", s.requireReady(handlers.GetClusterPackageConfigurationInput))
+	router.Handle("GET /packages/{manifestName}/configuration/{valueName}", s.requireReady(handlers.GetPackageConfigurationInput))
+	router.Handle("GET /packages/{manifestName}/{namespace}/{name}/configuration/{valueName}", s.requireReady(handlers.GetPackageConfigurationInput))
+
+	// datalists
+	router.Handle("GET /datalists/{valueName}/names", s.requireReady(handlers.GetNamesDatalist))
+	router.Handle("GET /datalists/{valueName}/keys", s.requireReady(handlers.GetKeysDatalist))
+
+	// open
+	router.Handle("POST /clusterpackages/{manifestName}/open", s.requireReady(handlers.PostOpenClusterPackage))
+	router.Handle("POST /packages/{manifestName}/{namespace}/{name}/open", s.requireReady(handlers.PostOpenPackage))
+
+	// uninstall
+	router.Handle("GET /clusterpackages/{manifestName}/uninstall", s.requireReady(handlers.GetUninstallClusterPackage))
+	router.Handle("POST /clusterpackages/{manifestName}/uninstall", s.requireReady(handlers.PostUninstallClusterPackage))
+	router.Handle("GET /packages/{manifestName}/{namespace}/{name}/uninstall", s.requireReady(handlers.GetUninstallPackage))
+	router.Handle("POST /packages/{manifestName}/{namespace}/{name}/uninstall", s.requireReady(handlers.PostUninstallPackage))
+
+	// suspend
+	router.Handle("POST /clusterpackages/{manifestName}/suspend", s.requireReady(handlers.PostSuspend))
+	router.Handle("POST /packages/{manifestName}/{namespace}/{name}/suspend", s.requireReady(handlers.PostSuspend))
+	router.Handle("POST /clusterpackages/{manifestName}/resume", s.requireReady(handlers.PostResume))
+	router.Handle("POST /packages/{manifestName}/{namespace}/{name}/resume", s.requireReady(handlers.PostResume))
+
+	// setup
+	router.HandleFunc("GET /support", s.supportPage)
+	router.HandleFunc("GET /kubeconfig", s.getKubeconfigPage)
+	router.HandleFunc("POST /kubeconfig", s.postKubeconfig)
+	router.Handle("GET /bootstrap", s.requireKubeconfig(s.getBootstrap))
+	router.Handle("POST /bootstrap", s.requireKubeconfig(s.postBootstrap))
+	router.Handle("POST /kubeconfig/persist", s.requireKubeconfig(s.persistKubeconfig))
+
+	router.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/clusterpackages", http.StatusFound)
 	})
-	http.Handle("/", s.enrichContext(router))
+	telemetryMiddleware := telemetry.HttpMiddleware(telemetry.WithPathRedactor(packagesPathRedactor))
+	http.Handle("/", telemetryMiddleware(s.enrichContext(router)))
 
 	s.listener, err = net.Listen("tcp", net.JoinHostPort(s.Host, s.Port))
 	if err != nil {
@@ -292,600 +281,10 @@ func (s *server) shutdown() {
 	close(s.httpServerHasShutdownCh)
 }
 
-// uninstall is an endpoint, which returns the modal html for GET requests, and performs the update for POST
-func (s *server) update(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	pkgName := mux.Vars(r)["pkgName"]
-	manifestName := mux.Vars(r)["manifestName"]
-	namespace := mux.Vars(r)["namespace"]
-	name := mux.Vars(r)["name"]
-
-	if r.Method == http.MethodPost {
-		updater := update.NewUpdater(ctx)
-		s.updateMutex.Lock()
-		defer s.updateMutex.Unlock()
-		utIdStr := r.FormValue("updateTransactionId")
-		if utId, err := strconv.Atoi(utIdStr); err != nil {
-			s.sendToast(w,
-				toast.WithErr(fmt.Errorf("failed to parse updateTransactionId %v: %w", utIdStr, err)),
-				toast.WithStatusCode(http.StatusBadRequest))
-			return
-		} else if ut, ok := s.updateTransactions[utId]; !ok {
-			s.sendToast(w,
-				toast.WithErr(fmt.Errorf("failed to find updateTransactionId %v", utId)),
-				toast.WithStatusCode(http.StatusNotFound))
-			return
-		} else if _, err := updater.Apply(
-			ctx,
-			&ut,
-			update.ApplyUpdateOptions{
-				Blocking: false,
-				DryRun:   false,
-			}); err != nil {
-			delete(s.updateTransactions, utId)
-			s.sendToast(w, toast.WithErr(fmt.Errorf("failed to apply update: %w", err)))
-			return
-		} else {
-			delete(s.updateTransactions, utId)
-		}
-	} else {
-		packageHref := ""
-		updates := make([]map[string]any, 0)
-		updateGetters := make([]update.PackagesGetter, 0, 1)
-		if pkgName != "" {
-			packageHref = "/clusterpackages/" + pkgName
-			// update concerns cluster packages
-			if pkgName == "-" {
-				// prepare updates for all installed packages
-				updateGetters = append(updateGetters, update.GetAllClusterPackages())
-			} else {
-				// prepare update for a specific package
-				updateGetters = append(updateGetters, update.GetClusterPackageWithName(pkgName))
-			}
-		} else {
-			// update concerns namespaced packages
-			packageHref = util.GetNamespacedPkgHref(manifestName, namespace, name)
-			if manifestName == "-" {
-				// prepare updates for all installed namespaced packages
-				updateGetters = append(updateGetters, update.GetAllPackages(""))
-			} else {
-				// prepare update for a specific namespaced package
-				updateGetters = append(updateGetters, update.GetPackageWithName(namespace, name))
-			}
-		}
-
-		updater := update.NewUpdater(ctx)
-		updateTx, err := updater.Prepare(ctx, updateGetters...)
-		if err != nil {
-			s.sendToast(w, toast.WithErr(fmt.Errorf("failed to prepare update: %w", err)))
-			return
-		}
-		utId := rand.Int()
-		s.updateMutex.Lock()
-		s.updateTransactions[utId] = *updateTx
-		s.updateMutex.Unlock()
-
-		for _, u := range updateTx.Items {
-			if u.UpdateRequired() {
-				updates = append(updates, map[string]any{
-					"Package":        u.Package,
-					"CurrentVersion": u.Package.GetSpec().PackageInfo.Version,
-					"LatestVersion":  u.Version,
-				})
-			}
-		}
-		for _, req := range updateTx.Requirements {
-			updates = append(updates, map[string]any{
-				"Package":        req,
-				"CurrentVersion": "-",
-				"LatestVersion":  req.Version,
-			})
-		}
-
-		err = s.templates.pkgUpdateModalTmpl.Execute(w, map[string]any{
-			"UpdateTransactionId": utId,
-			"Updates":             updates,
-			"PackageHref":         packageHref,
-		})
-		util.CheckTmplError(err, "pkgUpdateModalTmpl")
-	}
-}
-
-// uninstall is an endpoint, which returns the modal html for GET requests, and performs the uninstallation for POST
-func (s *server) uninstall(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	pkgName := mux.Vars(r)["pkgName"]
-	manifestName := mux.Vars(r)["manifestName"]
-	namespace := mux.Vars(r)["namespace"]
-	name := mux.Vars(r)["name"]
-
-	if r.Method == http.MethodPost {
-		uninstaller := uninstall.NewUninstaller(s.pkgClient)
-		if pkgName != "" {
-			var pkg v1alpha1.ClusterPackage
-			if err := s.pkgClient.ClusterPackages().Get(ctx, pkgName, &pkg); err != nil {
-				s.sendToast(w, toast.WithErr(fmt.Errorf("failed to fetch clusterpackage %v: %w", pkgName, err)))
-				return
-			}
-			if err := uninstaller.Uninstall(ctx, &pkg); err != nil {
-				s.sendToast(w, toast.WithErr(fmt.Errorf("failed to uninstall clusterpackage %v: %w", pkgName, err)))
-				return
-			}
-		} else {
-			var pkg v1alpha1.Package
-			if err := s.pkgClient.Packages(namespace).Get(ctx, name, &pkg); err != nil {
-				s.sendToast(w, toast.WithErr(fmt.Errorf("failed to fetch package %v/%v: %w", namespace, name, err)))
-				return
-			}
-			if err := uninstaller.Uninstall(ctx, &pkg); err != nil {
-				s.sendToast(w, toast.WithErr(fmt.Errorf("failed to uninstall package %v/%v: %w", namespace, name, err)))
-				return
-			}
-		}
-	} else {
-		if pkgName != "" {
-			var pruned []string
-			var err error
-			// dependency checks are only necessary for clusterpackages, as there are no dependencies on namespaced packages
-			if g, err1 := s.dependencyMgr.NewGraph(r.Context()); err1 != nil {
-				err = fmt.Errorf("error validating uninstall: %w", err1)
-			} else {
-				g.Delete(pkgName)
-				pruned = g.Prune()
-				if err1 := g.Validate(); err1 != nil {
-					err = fmt.Errorf("%v cannot be uninstalled: %w", pkgName, err1)
-				}
-			}
-			err = s.templates.pkgUninstallModalTmpl.Execute(w, map[string]any{
-				"PackageName": pkgName,
-				"Pruned":      pruned,
-				"Err":         err,
-				"PackageHref": util.GetClusterPkgHref(pkgName),
-			})
-			util.CheckTmplError(err, "pkgUninstallModalTmpl")
-		} else {
-			err := s.templates.pkgUninstallModalTmpl.Execute(w, map[string]any{
-				"Namespace":   namespace,
-				"Name":        name,
-				"PackageHref": util.GetNamespacedPkgHref(manifestName, namespace, name),
-			})
-			util.CheckTmplError(err, "pkgUninstallModalTmpl")
-		}
-	}
-}
-
-func (s *server) open(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	pkgName := mux.Vars(r)["pkgName"]
-	namespace := mux.Vars(r)["namespace"]
-	name := mux.Vars(r)["name"]
-
-	if pkgName != "" {
-		var pkg v1alpha1.ClusterPackage
-		if err := s.pkgClient.ClusterPackages().Get(ctx, pkgName, &pkg); err != nil {
-			s.sendToast(w, toast.WithErr(fmt.Errorf("failed to fetch clusterpackage %v: %w", pkgName, err)))
-			return
-		}
-		s.handleOpen(ctx, w, &pkg)
-	} else {
-		var pkg v1alpha1.Package
-		if err := s.pkgClient.Packages(namespace).Get(ctx, name, &pkg); err != nil {
-			s.sendToast(w, toast.WithErr(fmt.Errorf("failed to fetch package %v/%v: %w", namespace, name, err)))
-			return
-		}
-		s.handleOpen(ctx, w, &pkg)
-	}
-}
-
-func (s *server) handleOpen(ctx context.Context, w http.ResponseWriter, pkg ctrlpkg.Package) {
-	fwName := cache.NewObjectName(pkg.GetNamespace(), pkg.GetName()).String()
-	if result, ok := s.forwarders[fwName]; ok {
-		result.WaitReady()
-		_ = cliutils.OpenInBrowser(result.Url)
-		return
-	}
-
-	result, err := open.NewOpener().Open(ctx, pkg, "", 0)
-	if err != nil {
-		s.sendToast(w, toast.WithErr(fmt.Errorf("failed to open %v: %w", pkg.GetName(), err)))
-	} else {
-		s.forwarders[fwName] = result
-		result.WaitReady()
-		_ = cliutils.OpenInBrowser(result.Url)
-		w.WriteHeader(http.StatusAccepted)
-	}
-}
-
-func (s *server) clusterPackages(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	clpkgs, listErr := list.NewLister(ctx).GetClusterPackagesWithStatus(ctx, list.ListOptions{IncludePackageInfos: true})
-	if listErr != nil && len(clpkgs) == 0 {
-		listErr = fmt.Errorf("could not load clusterpackages: %w", listErr)
-		fmt.Fprintf(os.Stderr, "%v\n", listErr)
-	}
-
-	// Call isUpdateAvailable for each installed clusterpackage.
-	// This is not the same as getting all updates in a single transaction, because some dependency
-	// conflicts could be resolvable by installing individual clpkgs.
-	installedClpkgs := make([]ctrlpkg.Package, 0, len(clpkgs))
-	clpkgUpdateAvailable := map[string]bool{}
-	for _, pkg := range clpkgs {
-		if pkg.ClusterPackage != nil {
-			installedClpkgs = append(installedClpkgs, pkg.ClusterPackage)
-		}
-		clpkgUpdateAvailable[pkg.Name] = s.isUpdateAvailableForPkg(r.Context(), pkg.ClusterPackage)
-	}
-
-	overallUpdatesAvailable := false
-	if len(installedClpkgs) > 0 {
-		overallUpdatesAvailable = s.isUpdateAvailable(r.Context(), installedClpkgs)
-	}
-
-	tmplErr := s.templates.clusterPkgsPageTemplate.Execute(w, s.enrichPage(r, map[string]any{
-		"ClusterPackages":               clpkgs,
-		"ClusterPackageUpdateAvailable": clpkgUpdateAvailable,
-		"UpdatesAvailable":              overallUpdatesAvailable,
-		"PackageHref":                   util.GetClusterPkgHref("-"),
-	}, listErr))
-	util.CheckTmplError(tmplErr, "clusterpackages")
-}
-
-func (s *server) packages(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	allPkgs, listErr := list.NewLister(ctx).GetPackagesWithStatus(ctx, list.ListOptions{IncludePackageInfos: true})
-	if listErr != nil {
-		listErr = fmt.Errorf("could not load packages: %w", listErr)
-		fmt.Fprintf(os.Stderr, "%v\n", listErr)
-		// TODO check again
-	}
-
-	packageUpdateAvailable := map[string]bool{}
-	var installed []*list.PackagesWithStatus
-	var available []*repotypes.PackageRepoIndexItem
-	var installedPkgs []ctrlpkg.Package
-	for _, pkgsWithStatus := range allPkgs {
-		if len(pkgsWithStatus.Packages) > 0 {
-			for _, pkgWithStatus := range pkgsWithStatus.Packages {
-				installedPkgs = append(installedPkgs, pkgWithStatus.Package)
-
-				// Call isUpdateAvailable for each installed package.
-				// This is not the same as getting all updates in a single transaction, because some dependency
-				// conflicts could be resolvable by installing individual packages.
-				packageUpdateAvailable[cache.MetaObjectToName(pkgWithStatus.Package).String()] =
-					s.isUpdateAvailableForPkg(ctx, pkgWithStatus.Package)
-			}
-			installed = append(installed, pkgsWithStatus)
-		} else {
-			available = append(available, &pkgsWithStatus.PackageRepoIndexItem)
-		}
-	}
-
-	overallUpdatesAvailable := false
-	if len(installedPkgs) > 0 {
-		overallUpdatesAvailable = s.isUpdateAvailable(r.Context(), installedPkgs)
-	}
-
-	tmplErr := s.templates.pkgsPageTmpl.Execute(w, s.enrichPage(r, map[string]any{
-		"InstalledPackages":      installed,
-		"AvailablePackages":      available,
-		"PackageUpdateAvailable": packageUpdateAvailable,
-		"UpdatesAvailable":       overallUpdatesAvailable,
-		"PackageHref":            util.GetNamespacedPkgHref("-", "-", "-"),
-	}, listErr))
-	util.CheckTmplError(tmplErr, "packages")
-}
-
-// installOrConfigurePackage is like installOrConfigureClusterPackage but for packages
-func (s *server) installOrConfigurePackage(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	manifestName := mux.Vars(r)["manifestName"]
-	namespace := mux.Vars(r)["namespace"]
-	name := mux.Vars(r)["name"]
-	requestedNamespace := r.FormValue("requestedNamespace")
-	requestedName := r.FormValue("requestedName")
-	repositoryName := r.FormValue("repositoryName")
-	selectedVersion := r.FormValue("selectedVersion")
-	enableAutoUpdate := r.FormValue("enableAutoUpdate")
-
-	var err error
-	pkg := &v1alpha1.Package{}
-	var mf *v1alpha1.PackageManifest
-	if err := s.pkgClient.Packages(namespace).Get(ctx, name, pkg); err != nil && !apierrors.IsNotFound(err) {
-		s.sendToast(w, toast.WithErr(fmt.Errorf("failed to fetch package %v/%v: %w", namespace, name, err)))
-		return
-	} else if err != nil {
-		pkg = nil
-	}
-
-	repositoryName, mf, err = s.getUsedRepoAndManifest(ctx, pkg, repositoryName, manifestName, selectedVersion)
-	if err != nil {
-		s.sendToast(w, toast.WithErr(fmt.Errorf("failed to get manifest and repo of %v: %w", manifestName, err)))
-		return
-	}
-
-	if values, err := extractValues(r, mf); err != nil {
-		s.sendToast(w, toast.WithErr(fmt.Errorf("failed to parse values: %w", err)))
-		return
-	} else if pkg == nil {
-		pkg = client.PackageBuilder(manifestName).WithVersion(selectedVersion).
-			WithVersion(selectedVersion).
-			WithRepositoryName(repositoryName).
-			WithAutoUpdates(strings.ToLower(enableAutoUpdate) == "on").
-			WithValues(values).
-			WithNamespace(requestedNamespace).
-			WithName(requestedName).
-			BuildPackage()
-		opts := metav1.CreateOptions{}
-		err := install.NewInstaller(s.pkgClient).Install(ctx, pkg, opts)
-		if err != nil {
-			s.sendToast(w, toast.WithErr(fmt.Errorf("failed to install %v: %w", manifestName, err)))
-		} else {
-			s.swappingRedirect(w, "/packages", "main", "main")
-			w.WriteHeader(http.StatusAccepted)
-		}
-	} else {
-		pkg.Spec.Values = values
-		opts := metav1.UpdateOptions{}
-		if err := s.pkgClient.Packages(pkg.GetNamespace()).Update(ctx, pkg, opts); err != nil {
-			s.sendToast(w, toast.WithErr(fmt.Errorf("failed to configure %v: %w", manifestName, err)))
-			return
-		}
-		if _, err := s.valueResolver.Resolve(ctx, values); err != nil {
-			s.sendToast(w,
-				toast.WithErr(fmt.Errorf("some values could not be resolved: %w", err)),
-				toast.WithCssClass("warning"),
-				toast.WithStatusCode(http.StatusAccepted))
-		} else {
-			s.sendToast(w, toast.WithMessage("Configuration updated successfully"))
-		}
-	}
-}
-
-// installOrConfigureClusterPackage is an endpoint which takes POST requests, containing all necessary parameters to either
-// install a new package if it does not exist yet, or update the configuration of an existing package.
-// The name of the concerned package is given in the pkgName query parameter.
-// In case the given package is not installed yet in the cluster, there must be a form parameter selectedVersion
-// containing which version should be installed.
-// In either case, the parameters from the form are parsed and converted into ValueConfiguration objects, which are
-// being set in the packages spec.
-func (s *server) installOrConfigureClusterPackage(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	pkgName := mux.Vars(r)["pkgName"]
-	repositoryName := r.FormValue("repositoryName")
-	selectedVersion := r.FormValue("selectedVersion")
-	enableAutoUpdate := r.FormValue("enableAutoUpdate")
-	var err error
-	pkg := &v1alpha1.ClusterPackage{}
-	var mf *v1alpha1.PackageManifest
-	if err = s.pkgClient.ClusterPackages().Get(ctx, pkgName, pkg); err != nil && !apierrors.IsNotFound(err) {
-		s.sendToast(w, toast.WithErr(fmt.Errorf("failed to fetch clusterpackage %v: %w", pkgName, err)))
-		return
-	} else if err != nil {
-		pkg = nil
-	}
-
-	repositoryName, mf, err = s.getUsedRepoAndManifest(ctx, pkg, repositoryName, pkgName, selectedVersion)
-	if err != nil {
-		s.sendToast(w, toast.WithErr(fmt.Errorf("failed to get manifest and repo of %v: %w", pkgName, err)))
-		return
-	}
-
-	if values, err := extractValues(r, mf); err != nil {
-		s.sendToast(w, toast.WithErr(fmt.Errorf("failed to parse values: %w", err)))
-		return
-	} else if pkg == nil {
-		pkg = client.PackageBuilder(pkgName).WithVersion(selectedVersion).
-			WithVersion(selectedVersion).
-			WithRepositoryName(repositoryName).
-			WithAutoUpdates(strings.ToLower(enableAutoUpdate) == "on").
-			WithValues(values).
-			BuildClusterPackage()
-		opts := metav1.CreateOptions{}
-		err := install.NewInstaller(s.pkgClient).Install(ctx, pkg, opts)
-		if err != nil {
-			s.sendToast(w, toast.WithErr(fmt.Errorf("failed to install %v: %w", pkgName, err)))
-			return
-		}
-	} else {
-		pkg.Spec.Values = values
-		opts := metav1.UpdateOptions{}
-		if err := s.pkgClient.ClusterPackages().Update(ctx, pkg, opts); err != nil {
-			s.sendToast(w, toast.WithErr(fmt.Errorf("failed to configure %v: %w", pkgName, err)))
-			return
-		}
-		if _, err := s.valueResolver.Resolve(ctx, values); err != nil {
-			s.sendToast(w,
-				toast.WithErr(fmt.Errorf("some values could not be resolved: %w", err)),
-				toast.WithCssClass("warning"),
-				toast.WithStatusCode(http.StatusAccepted))
-		} else {
-			s.sendToast(w, toast.WithMessage("Configuration updated successfully"))
-		}
-	}
-}
-
-func (s *server) getUsedRepoAndManifest(ctx context.Context, pkg ctrlpkg.Package, repositoryName string, manifestName string, selectedVersion string) (
-	string, *v1alpha1.PackageManifest, error) {
-
-	var mf v1alpha1.PackageManifest
-	if pkg.IsNil() {
-		var repoClient repoclient.RepoClient
-		if len(repositoryName) == 0 {
-			repos, err := s.repoClientset.Meta().GetReposForPackage(manifestName)
-			if err != nil {
-				return "", nil, err
-			}
-			switch len(repos) {
-			case 0:
-				return "", nil, errors.New("package not found in any repository")
-			case 1:
-				repositoryName = repos[0].Name
-				repoClient = s.repoClientset.ForRepo(repos[0])
-			default:
-				return "", nil, errors.New("package found in multiple repositories")
-			}
-		} else {
-			repoClient = s.repoClientset.ForRepoWithName(repositoryName)
-		}
-		if err := repoClient.FetchPackageManifest(manifestName, selectedVersion, &mf); err != nil {
-			return "", nil, err
-		}
-	} else {
-		if installedMf, err := manifest.GetInstalledManifestForPackage(ctx, pkg); err != nil {
-			return "", nil, err
-		} else {
-			mf = *installedMf
-		}
-	}
-	return repositoryName, &mf, nil
-}
-
-// advancedClusterPackageConfiguration is a GET+POST endpoint which can be used for advanced package installation options,
-// most notably for changing the package repository and changing to a specific (maybe even lower than installed)
-// version of the package.
-// It is only intended to be used for already installed clusterpackages, for new clusterpackages these options exist
-// anyway and should be available for every user.
-func (s *server) advancedClusterPackageConfiguration(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	pkgName := mux.Vars(r)["pkgName"]
-	repositoryName := r.FormValue("repositoryName")
-	selectedVersion := r.FormValue("selectedVersion")
-	pkg, manifest, err := describe.DescribeInstalledClusterPackage(ctx, pkgName)
-	if err != nil && !apierrors.IsNotFound(err) {
-		s.sendToast(w, toast.WithErr(fmt.Errorf("failed to fetch clusterpackage %v: %w", pkgName, err)))
-		return
-	} else if pkg == nil {
-		s.sendToast(w,
-			toast.WithErr(fmt.Errorf("clusterpackage %v is not installed", pkgName)),
-			toast.WithStatusCode(http.StatusNotFound))
-		return
-	} else if repositoryName == "" {
-		repositoryName = pkg.Spec.PackageInfo.RepositoryName
-	}
-	s.handleAdvancedConfig(ctx, &packageDetailPageContext{
-		repositoryName:  repositoryName,
-		selectedVersion: selectedVersion,
-		manifestName:    pkgName,
-		pkg:             pkg,
-		manifest:        manifest,
-	}, r, w)
-}
-
-// advancedPackageConfiguration is like advancedClusterPackageConfiguration but for packages
-func (s *server) advancedPackageConfiguration(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	manifestName := mux.Vars(r)["manifestName"]
-	namespace := mux.Vars(r)["namespace"]
-	name := mux.Vars(r)["name"]
-	repositoryName := r.FormValue("repositoryName")
-	selectedVersion := r.FormValue("selectedVersion")
-	pkg, manifest, err := describe.DescribeInstalledPackage(ctx, namespace, name)
-	if err != nil && !apierrors.IsNotFound(err) {
-		s.sendToast(w, toast.WithErr(fmt.Errorf("failed to fetch package %v/%v: %w", namespace, name, err)))
-		return
-	} else if pkg == nil {
-		s.sendToast(w,
-			toast.WithErr(fmt.Errorf("package %v/%v is not installed", namespace, name)),
-			toast.WithStatusCode(http.StatusNotFound))
-		return
-	} else if repositoryName == "" {
-		repositoryName = pkg.Spec.PackageInfo.RepositoryName
-	}
-	s.handleAdvancedConfig(ctx, &packageDetailPageContext{
-		repositoryName:  repositoryName,
-		selectedVersion: selectedVersion,
-		manifestName:    manifestName,
-		pkg:             pkg,
-		manifest:        manifest,
-	}, r, w)
-}
-
-func (s *server) handleAdvancedConfig(ctx context.Context, d *packageDetailPageContext, r *http.Request, w http.ResponseWriter) {
-	var err error
-	var repos []v1alpha1.PackageRepository
-	if repos, err = s.repoClientset.Meta().GetReposForPackage(d.manifestName); err != nil {
-		fmt.Fprintf(os.Stderr, "error getting repos for package; %v", err)
-	} else if d.repositoryName == "" {
-		if len(repos) == 0 {
-			s.sendToast(w,
-				toast.WithErr(fmt.Errorf("manifest %v not found in any repo", d.manifestName)),
-				toast.WithStatusCode(http.StatusNotFound))
-			return
-		}
-		for _, r := range repos {
-			d.repositoryName = r.Name
-			if r.IsDefaultRepository() {
-				break
-			}
-		}
-	}
-
-	if r.Method == http.MethodGet {
-		var idx repo.PackageIndex
-		if err := s.repoClientset.ForRepoWithName(d.repositoryName).FetchPackageIndex(d.manifestName, &idx); err != nil {
-			s.sendToast(w,
-				toast.WithErr(fmt.Errorf("failed to fetch package index of %v in repo %v: %w", d.manifestName, d.repositoryName, err)))
-			return
-		}
-		latestVersion := idx.LatestVersion
-
-		if d.selectedVersion == "" {
-			d.selectedVersion = latestVersion
-		} else if !slices.ContainsFunc(idx.Versions, func(item repotypes.PackageIndexItem) bool {
-			return item.Version == d.selectedVersion
-		}) {
-			d.selectedVersion = latestVersion
-		}
-
-		res, err := s.dependencyMgr.Validate(r.Context(), d.manifest, d.selectedVersion)
-		if err != nil {
-			s.sendToast(w,
-				toast.WithErr(fmt.Errorf("failed to validate dependencies of %v in version %v: %w", d.manifestName, d.selectedVersion, err)))
-			return
-		}
-
-		err = s.templates.pkgConfigAdvancedTmpl.Execute(w, s.enrichPage(r, map[string]any{
-			"Status":           client.GetStatusOrPending(d.pkg),
-			"Manifest":         d.manifest,
-			"LatestVersion":    latestVersion,
-			"ValidationResult": res,
-			"ShowConflicts":    res.Status == dependency.ValidationResultStatusConflict,
-			"SelectedVersion":  d.selectedVersion,
-			"PackageIndex":     &idx,
-			"Repositories":     repos,
-			"RepositoryName":   d.repositoryName,
-			"SelfHref":         fmt.Sprintf("%s/configure/advanced", util.GetPackageHref(d.pkg, d.manifest)),
-		}, err))
-		util.CheckTmplError(err, fmt.Sprintf("advanced-config (%s)", d.manifestName))
-	} else if r.Method == http.MethodPost {
-		opts := metav1.UpdateOptions{}
-		d.pkg.GetSpec().PackageInfo.Version = d.selectedVersion
-		if d.repositoryName != "" {
-			d.pkg.GetSpec().PackageInfo.RepositoryName = d.repositoryName
-		}
-		switch pkg := d.pkg.(type) {
-		case *v1alpha1.ClusterPackage:
-			if err := s.pkgClient.ClusterPackages().Update(ctx, pkg, opts); err != nil {
-				s.sendToast(w,
-					toast.WithErr(fmt.Errorf("failed to update clusterpackage %v to version %v in repo %v: %w",
-						d.manifestName, d.selectedVersion, d.repositoryName, err)))
-				return
-			} else {
-				s.sendToast(w, toast.WithMessage("Configuration updated successfully"))
-			}
-		case *v1alpha1.Package:
-			if err := s.pkgClient.Packages(d.pkg.GetNamespace()).Update(ctx, pkg, metav1.UpdateOptions{}); err != nil {
-				s.sendToast(w,
-					toast.WithErr(fmt.Errorf("failed to update clusterpackage %v to version %v in repo %v: %w",
-						d.manifestName, d.selectedVersion, d.repositoryName, err)))
-				return
-			} else {
-				s.sendToast(w, toast.WithMessage("Configuration updated successfully"))
-			}
-		default:
-			panic("unexpected package type")
-		}
-	}
+type supportPageData struct {
+	types.TemplateContextHolder
+	KubeconfigDefaultLocation string
+	Err                       error
 }
 
 func (s *server) supportPage(w http.ResponseWriter, r *http.Request) {
@@ -894,156 +293,92 @@ func (s *server) supportPage(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/bootstrap", http.StatusFound)
 			return
 		}
-		err := s.templates.supportPageTmpl.Execute(w, &map[string]any{
-			"CurrentContext":            "",
-			"KubeconfigDefaultLocation": clientcmd.RecommendedHomeFile,
-			"Err":                       err,
-		})
-		util.CheckTmplError(err, "support")
+		responder.SendPage(w, r, "pages/support", responder.ContextualizedTemplate(&supportPageData{
+			KubeconfigDefaultLocation: clientcmd.RecommendedHomeFile,
+			Err:                       err,
+		}))
 	} else {
 		http.Redirect(w, r, "/", http.StatusFound)
 	}
 }
 
-func (s *server) bootstrapPage(w http.ResponseWriter, r *http.Request) {
+type bootstrapPageData struct {
+	types.TemplateContextHolder
+	Err error
+}
+
+func (s *server) getBootstrap(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if r.Method == "POST" {
-		client := bootstrap.NewBootstrapClient(s.restConfig)
-		if _, err := client.Bootstrap(ctx, bootstrap.DefaultOptions()); err != nil {
-			fmt.Fprintf(os.Stderr, "\nAn error occurred during bootstrap:\n%v\n", err)
-			err := s.templates.bootstrapPageTmpl.ExecuteTemplate(w, "bootstrap-failure", nil)
-			util.CheckTmplError(err, "bootstrap-failure")
-		} else {
-			err := s.templates.bootstrapPageTmpl.ExecuteTemplate(w, "bootstrap-success", nil)
-			util.CheckTmplError(err, "bootstrap-success")
-		}
-	} else {
-		isBootstrapped, err := bootstrap.IsBootstrapped(ctx, s.restConfig)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "\nFailed to check whether Glasskube is bootstrapped: %v\n\n", err)
-		} else if isBootstrapped {
-			http.Redirect(w, r, "/", http.StatusFound)
-			return
-		}
-		tplErr := s.templates.bootstrapPageTmpl.Execute(w, &map[string]any{
-			"CloudId":        telemetry.GetMachineId(),
-			"CurrentContext": s.rawConfig.CurrentContext,
-			"Err":            err,
-		})
-		util.CheckTmplError(tplErr, "bootstrap")
-	}
-}
-
-func (s *server) kubeconfigPage(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost {
-		file, _, err := r.FormFile("kubeconfig")
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		data, err := io.ReadAll(file)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		s.loadBytesConfig(data)
-		if err := s.checkKubeconfig(); err != nil {
-			fmt.Fprintf(os.Stderr, "The selected kubeconfig is invalid: %v\n", err)
-		} else {
-			fmt.Fprintln(os.Stderr, "The selected kubeconfig is valid!")
-		}
-	}
-
-	configErr := s.checkKubeconfig()
-	var currentContext string
-	if s.rawConfig != nil {
-		currentContext = s.rawConfig.CurrentContext
-	}
-	tplErr := s.templates.kubeconfigPageTmpl.Execute(w, map[string]any{
-		"CloudId":                   telemetry.GetMachineId(),
-		"CurrentContext":            currentContext,
-		"ConfigErr":                 configErr,
-		"KubeconfigDefaultLocation": clientcmd.RecommendedHomeFile,
-		"DefaultKubeconfigExists":   defaultKubeconfigExists(),
-	})
-	util.CheckTmplError(tplErr, "kubeconfig")
-}
-
-func (s *server) settingsPage(w http.ResponseWriter, r *http.Request) {
-	var repos v1alpha1.PackageRepositoryList
-	if err := s.pkgClient.PackageRepositories().GetAll(r.Context(), &repos); err != nil {
-		s.sendToast(w, toast.WithErr(fmt.Errorf("failed to fetch repositories: %w", err)))
+	isBootstrapped, err := bootstrap.IsBootstrapped(ctx, s.restConfig)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\nFailed to check whether Glasskube is bootstrapped: %v\n\n", err)
+	} else if isBootstrapped {
+		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-
-	tmplErr := s.templates.settingsPageTmpl.Execute(w, s.enrichPage(r, map[string]any{
-		"Repositories": repos.Items,
-	}, nil))
-	util.CheckTmplError(tmplErr, "settings")
+	responder.SendPage(w, r, "pages/bootstrap", responder.ContextualizedTemplate(&bootstrapPageData{
+		Err: err,
+	}))
 }
 
-func (s *server) enrichPage(r *http.Request, data map[string]any, err error) map[string]any {
-	data["CloudId"] = telemetry.GetMachineId()
-	if pathParts := strings.Split(r.URL.Path, "/"); len(pathParts) >= 2 {
-		data["NavbarActiveItem"] = pathParts[1]
+func (s *server) postBootstrap(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	client := bootstrap.NewBootstrapClient(s.restConfig)
+	if _, err := client.Bootstrap(ctx, bootstrap.DefaultOptions()); err != nil {
+		fmt.Fprintf(os.Stderr, "\nAn error occurred during bootstrap:\n%v\n", err)
+		responder.SendComponent(w, r, "components/bootstrap-failure")
+	} else {
+		responder.SendComponent(w, r, "components/bootstrap-success")
 	}
-	data["Error"] = err
-	data["CurrentContext"] = s.rawConfig.CurrentContext
-	operatorVersion, clientVersion, err := s.getGlasskubeVersions(r.Context())
+}
+
+func (s *server) postKubeconfig(w http.ResponseWriter, r *http.Request) {
+	file, _, err := r.FormFile("kubeconfig")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to check for version mismatch: %v\n", err)
-	} else if operatorVersion != nil && clientVersion != nil && !operatorVersion.Equal(clientVersion) {
-		data["VersionMismatchWarning"] = true
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
-	if operatorVersion != nil && clientVersion != nil && !config.IsDevBuild() {
-		data["VersionDetails"] = map[string]any{
-			"OperatorVersion":     operatorVersion.String(),
-			"ClientVersion":       clientVersion.String(),
-			"NeedsOperatorUpdate": operatorVersion.LessThan(clientVersion),
-		}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
-	if config.IsDevBuild() {
-		data["VersionDetails"] = map[string]any{
-			"OperatorVersion": config.Version,
-			"ClientVersion":   config.Version,
-		}
+	s.loadBytesConfig(data)
+	if err := s.checkKubeconfig(); err != nil {
+		fmt.Fprintf(os.Stderr, "The selected kubeconfig is invalid: %v\n", err)
+	} else {
+		fmt.Fprintln(os.Stderr, "The selected kubeconfig is valid!")
 	}
-	data["CacheBustingString"] = config.Version
-	return data
+
+	s.getKubeconfigPage(w, r)
 }
 
-func (server *server) getGlasskubeVersions(ctx context.Context) (*semver.Version, *semver.Version, error) {
-	if !config.IsDevBuild() {
-		if operatorVersion, err := clientutils.GetPackageOperatorVersion(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to check package operator version: %v\n", err)
-			return nil, nil, err
-		} else if parsedOperator, err := semver.NewVersion(operatorVersion); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to parse operator version %v: %v\n", operatorVersion, err)
-			return nil, nil, err
-		} else if parsedClient, err := semver.NewVersion(config.Version); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to parse client version %v: %v\n", config.Version, err)
-			return nil, nil, err
-		} else {
-			return parsedOperator, parsedClient, nil
-		}
-	}
-	return nil, nil, nil
+type kubeconfigPageData struct {
+	types.TemplateContextHolder
+	ConfigErr                 error
+	KubeconfigDefaultLocation string
+	DefaultKubeconfigExists   bool
+}
+
+func (s *server) getKubeconfigPage(w http.ResponseWriter, r *http.Request) {
+	configErr := s.checkKubeconfig()
+	responder.SendPage(w, r, "pages/kubeconfig", responder.ContextualizedTemplate(&kubeconfigPageData{
+		ConfigErr:                 configErr,
+		KubeconfigDefaultLocation: clientcmd.RecommendedHomeFile,
+		DefaultKubeconfigExists:   defaultKubeconfigExists(),
+	}))
 }
 
 func (s *server) persistKubeconfig(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost {
-		if !defaultKubeconfigExists() {
-			if err := clientcmd.WriteToFile(*s.rawConfig, clientcmd.RecommendedHomeFile); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-			} else {
-				http.Redirect(w, r, "/", http.StatusFound)
-			}
+	if !defaultKubeconfigExists() {
+		if err := clientcmd.WriteToFile(*s.rawConfig, clientcmd.RecommendedHomeFile); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 		} else {
-			fmt.Fprintln(os.Stderr, "default kubeconfig already exists! nothing was saved")
-			http.Error(w, "", http.StatusBadRequest)
+			http.Redirect(w, r, "/", http.StatusFound)
 		}
 	} else {
-		http.Error(w, "only POST is supported", http.StatusMethodNotAllowed)
+		fmt.Fprintln(os.Stderr, "default kubeconfig already exists! nothing was saved")
+		http.Error(w, "", http.StatusBadRequest)
 	}
 }
 
@@ -1053,7 +388,7 @@ func (server *server) loadBytesConfig(data []byte) {
 
 func (server *server) checkKubeconfig() ServerConfigError {
 	if server.pkgClient == nil {
-		return server.initKubeConfig()
+		return server.initKubeConfigAndStartListers()
 	} else {
 		return nil
 	}
@@ -1084,7 +419,7 @@ func (server *server) ensureBootstrapped(ctx context.Context) ServerConfigError 
 	return nil
 }
 
-func (server *server) initKubeConfig() ServerConfigError {
+func (server *server) initKubeConfigAndStartListers() ServerConfigError {
 	restConfig, rawConfig, err := server.LoadConfig()
 	if err != nil {
 		return newKubeconfigErr(err)
@@ -1093,41 +428,37 @@ func (server *server) initKubeConfig() ServerConfigError {
 	if err != nil {
 		return newKubeconfigErr(err)
 	}
-	telemetry.InitClient(restConfig)
 
 	server.restConfig = restConfig
 	server.rawConfig = rawConfig
 	server.nonCachedClient = client // this should never be overridden
 	server.pkgClient = client       // be aware that server.pkgClient is overridden with the cached client once bootstrap check succeeded
+
+	server.k8sClient = kubernetes.NewForConfigOrDie(server.restConfig)
+	factory := informers.NewSharedInformerFactory(server.k8sClient, 0)
+	c := make(chan struct{})
+	namespaceLister := factory.Core().V1().Namespaces().Lister()
+	configMapLister := factory.Core().V1().ConfigMaps().Lister()
+	secretLister := factory.Core().V1().Secrets().Lister()
+	deploymentLister := factory.Apps().V1().Deployments().Lister()
+	server.coreListers = &types.CoreListers{
+		NamespaceLister:  &namespaceLister,
+		ConfigMapLister:  &configMapLister,
+		SecretLister:     &secretLister,
+		DeploymentLister: &deploymentLister,
+	}
+	factory.Start(c) // TODO maybe the stop channel should be something else??
+	telemetry.InitClient(restConfig, &namespaceLister)
 	return nil
 }
 
 func (server *server) initWhenBootstrapped(ctx context.Context) {
-	server.k8sClient = kubernetes.NewForConfigOrDie(server.restConfig)
 	server.initCachedClient(context.WithoutCancel(ctx))
 	server.initClientDependentComponents()
-	factory := informers.NewSharedInformerFactory(server.k8sClient, 0)
-	c := make(chan struct{})
-	namespaceLister := factory.Core().V1().Namespaces().Lister()
-	server.namespaceLister = &namespaceLister
-	configMapLister := factory.Core().V1().ConfigMaps().Lister()
-	server.configMapLister = &configMapLister
-	secretLister := factory.Core().V1().Secrets().Lister()
-	server.secretLister = &secretLister
-	factory.Start(c)
 }
 
 func (server *server) initClientDependentComponents() {
 	server.repoClientset = repoclient.NewClientset(
-		clientadapter.NewPackageClientAdapter(server.pkgClient),
-		clientadapter.NewKubernetesClientAdapter(server.k8sClient),
-	)
-	server.templates.repoClientset = server.repoClientset
-	server.dependencyMgr = dependency.NewDependencyManager(
-		clientadapter.NewPackageClientAdapter(server.pkgClient),
-		server.repoClientset,
-	)
-	server.valueResolver = manifestvalues.NewResolver(
 		clientadapter.NewPackageClientAdapter(server.pkgClient),
 		clientadapter.NewKubernetesClientAdapter(server.k8sClient),
 	)
@@ -1227,11 +558,11 @@ func (s *server) handleVerificationError(err error) {
 }
 
 func (s *server) enrichContext(h http.Handler) http.Handler {
-	return &handler.ContextEnrichingHandler{Source: s, Handler: h}
+	return &middleware.ContextEnrichingHandler{Source: s, Handler: h}
 }
 
 func (s *server) requireReady(h http.HandlerFunc) http.Handler {
-	return &handler.PreconditionHandler{
+	return &middleware.PreconditionHandler{
 		Precondition: func(r *http.Request) error {
 			err := s.ensureBootstrapped(r.Context())
 			if err != nil {
@@ -1245,7 +576,7 @@ func (s *server) requireReady(h http.HandlerFunc) http.Handler {
 }
 
 func (s *server) requireKubeconfig(h http.HandlerFunc) http.Handler {
-	return &handler.PreconditionHandler{
+	return &middleware.PreconditionHandler{
 		Precondition:  func(r *http.Request) error { return s.checkKubeconfig() },
 		Handler:       h,
 		FailedHandler: handleConfigError,
@@ -1277,8 +608,8 @@ func defaultKubeconfigExists() bool {
 
 func (s *server) initClusterPackageStoreAndController(ctx context.Context) (cache.Store, cache.Controller) {
 	pkgClient := s.nonCachedClient
-	return cache.NewInformer(
-		&cache.ListWatch{
+	return cache.NewInformerWithOptions(cache.InformerOptions{
+		ListerWatcher: &cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 				var pkgList v1alpha1.ClusterPackageList
 				err := pkgClient.ClusterPackages().GetAll(ctx, &pkgList)
@@ -1288,9 +619,8 @@ func (s *server) initClusterPackageStoreAndController(ctx context.Context) (cach
 				return pkgClient.ClusterPackages().Watch(ctx, options)
 			},
 		},
-		&v1alpha1.ClusterPackage{},
-		0,
-		cache.ResourceEventHandlerFuncs{
+		ObjectType: &v1alpha1.ClusterPackage{},
+		Handler: cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj any) {
 				if pkg, ok := obj.(*v1alpha1.ClusterPackage); ok {
 					s.broadcaster.UpdatesAvailableForPackage(nil, pkg)
@@ -1306,21 +636,17 @@ func (s *server) initClusterPackageStoreAndController(ctx context.Context) (cach
 			DeleteFunc: func(obj any) {
 				if pkg, ok := obj.(*v1alpha1.ClusterPackage); ok {
 					s.broadcaster.UpdatesAvailableForPackage(pkg, nil)
-					fwName := pkg.GetName()
-					if result, ok := s.forwarders[fwName]; ok {
-						result.Stop()
-						delete(s.forwarders, fwName)
-					}
+					webopen.CloseForwarders(pkg)
 				}
 			},
 		},
-	)
+	})
 }
 
 func (s *server) initPackageStoreAndController(ctx context.Context) (cache.Store, cache.Controller) {
 	pkgClient := s.nonCachedClient
-	return cache.NewInformer(
-		&cache.ListWatch{
+	return cache.NewInformerWithOptions(cache.InformerOptions{
+		ListerWatcher: &cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 				var pkgList v1alpha1.PackageList
 				err := pkgClient.Packages("").GetAll(ctx, &pkgList)
@@ -1330,9 +656,8 @@ func (s *server) initPackageStoreAndController(ctx context.Context) (cache.Store
 				return pkgClient.Packages("").Watch(ctx, options)
 			},
 		},
-		&v1alpha1.Package{},
-		0,
-		cache.ResourceEventHandlerFuncs{
+		ObjectType: &v1alpha1.Package{},
+		Handler: cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj any) {
 				if pkg, ok := obj.(*v1alpha1.Package); ok {
 					s.broadcaster.UpdatesAvailableForPackage(nil, pkg)
@@ -1348,21 +673,17 @@ func (s *server) initPackageStoreAndController(ctx context.Context) (cache.Store
 			DeleteFunc: func(obj any) {
 				if pkg, ok := obj.(*v1alpha1.Package); ok {
 					s.broadcaster.UpdatesAvailableForPackage(pkg, nil)
-					fwName := cache.ObjectName{Namespace: pkg.GetNamespace(), Name: pkg.GetName()}.String()
-					if result, ok := s.forwarders[fwName]; ok {
-						result.Stop()
-						delete(s.forwarders, fwName)
-					}
+					webopen.CloseForwarders(pkg)
 				}
 			},
 		},
-	)
+	})
 }
 
 func (s *server) initPackageInfoStoreAndController(ctx context.Context) (cache.Store, cache.Controller) {
 	pkgClient := s.nonCachedClient
-	return cache.NewInformer(
-		&cache.ListWatch{
+	return cache.NewInformerWithOptions(cache.InformerOptions{
+		ListerWatcher: &cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 				var packageInfoList v1alpha1.PackageInfoList
 				err := pkgClient.PackageInfos().GetAll(ctx, &packageInfoList)
@@ -1372,16 +693,15 @@ func (s *server) initPackageInfoStoreAndController(ctx context.Context) (cache.S
 				return pkgClient.PackageInfos().Watch(ctx, options)
 			},
 		},
-		&v1alpha1.PackageInfo{},
-		0,
-		cache.ResourceEventHandlerFuncs{},
-	)
+		ObjectType: &v1alpha1.PackageInfo{},
+		Handler:    cache.ResourceEventHandlerFuncs{},
+	})
 }
 
 func (s *server) initPackageRepoStoreAndController(ctx context.Context) (cache.Store, cache.Controller) {
 	pkgClient := s.nonCachedClient
-	return cache.NewInformer(
-		&cache.ListWatch{
+	return cache.NewInformerWithOptions(cache.InformerOptions{
+		ListerWatcher: &cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 				var repositoryList v1alpha1.PackageRepositoryList
 				err := pkgClient.PackageRepositories().GetAll(ctx, &repositoryList)
@@ -1391,24 +711,7 @@ func (s *server) initPackageRepoStoreAndController(ctx context.Context) (cache.S
 				return pkgClient.PackageRepositories().Watch(ctx, options)
 			},
 		},
-		&v1alpha1.PackageRepository{},
-		0,
-		cache.ResourceEventHandlerFuncs{}, // TODO we might also want to update here?
-	)
-}
-
-func (s *server) isUpdateAvailableForPkg(ctx context.Context, pkg ctrlpkg.Package) bool {
-	if pkg.IsNil() {
-		return false
-	}
-	return s.isUpdateAvailable(ctx, []ctrlpkg.Package{pkg})
-}
-
-func (s *server) isUpdateAvailable(ctx context.Context, pkgs []ctrlpkg.Package) bool {
-	if tx, err := update.NewUpdater(ctx).Prepare(ctx, update.GetExact(pkgs)); err != nil {
-		fmt.Fprintf(os.Stderr, "Error checking for updates: %v\n", err)
-		return false
-	} else {
-		return !tx.IsEmpty()
-	}
+		ObjectType: &v1alpha1.PackageRepository{},
+		Handler:    cache.ResourceEventHandlerFuncs{}, // TODO we might also want to update here?
+	})
 }

@@ -14,12 +14,14 @@ import (
 type OpenCmdOptions struct {
 	NamespaceOptions
 	KindOptions
-	Port int32
+	host string
+	port int32
 }
 
 var (
 	openCmdOptions = OpenCmdOptions{
 		KindOptions: DefaultKindOptions(),
+		host:        "localhost",
 	}
 )
 
@@ -28,7 +30,15 @@ var openCmd = &cobra.Command{
 	Short: "Open the Web UI of a package",
 	Long: `Open the Web UI of a package.
 If the package manifest has more than one entrypoint, specify the name of the entrypoint to open.`,
-	Args:   cobra.RangeArgs(1, 2),
+	Args: cobra.RangeArgs(1, 2),
+	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		if len(args) == 0 {
+			delegate := installedPackagesCompletionFunc(&openCmdOptions.NamespaceOptions, &openCmdOptions.KindOptions)
+			return delegate(cmd, args, toComplete)
+		} else {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+	},
 	PreRun: cliutils.SetupClientContext(true, &rootCmdOptions.SkipUpdateCheck),
 	Run: func(cmd *cobra.Command, args []string) {
 		ctx := cmd.Context()
@@ -44,7 +54,7 @@ If the package manifest has more than one entrypoint, specify the name of the en
 			cliutils.ExitWithError()
 		}
 
-		result, err := open.NewOpener().Open(ctx, pkg, entrypointName, openCmdOptions.Port)
+		result, err := open.NewOpener().Open(ctx, pkg, entrypointName, openCmdOptions.host, openCmdOptions.port)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Could not open package %v: %v\n", pkgName, err)
 			cliutils.ExitWithError()
@@ -91,6 +101,8 @@ If the package manifest has more than one entrypoint, specify the name of the en
 func init() {
 	openCmdOptions.KindOptions.AddFlagsToCommand(openCmd)
 	openCmdOptions.NamespaceOptions.AddFlagsToCommand(openCmd)
-	openCmd.Flags().Int32Var(&openCmdOptions.Port, "port", openCmdOptions.Port, "Custom port for opening the package")
+	openCmd.Flags().StringVar(&openCmdOptions.host, "host", openCmdOptions.host,
+		"Custom hostname to open the local port on")
+	openCmd.Flags().Int32Var(&openCmdOptions.port, "port", openCmdOptions.port, "Custom port for opening the package")
 	RootCmd.AddCommand(openCmd)
 }

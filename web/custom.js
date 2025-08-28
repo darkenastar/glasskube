@@ -23,9 +23,14 @@
     });
 })();
 
-window.advancedOptions = function (currentContext) {
-  return localStorage.getItem('advancedOptions_' + currentContext) === 'true';
-};
+(() => {
+  const modal = document.getElementById('modal-container');
+  modal.addEventListener('show.bs.modal', (evt) => {
+    // https://getbootstrap.com/docs/5.3/components/modal/#events
+    // "hidden.bs.modal" is too early to clear innerHTML – the form submission from inside the modal would be cancelled
+    modal.innerHTML = '';
+  });
+})();
 
 function setSSEDisconnected() {
   const elem = document.getElementById('disconnected-toast');
@@ -57,7 +62,7 @@ function handleGiscusMessage(ev) {
     const githubUrl = giscusData['viewer']['url'];
     const formData = new FormData();
     formData.append('githubUrl', githubUrl);
-    fetch('', {
+    fetch('/giscus', {
       method: 'POST',
       body: formData,
     });

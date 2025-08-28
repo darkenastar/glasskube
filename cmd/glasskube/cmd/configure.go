@@ -1,41 +1,42 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"maps"
 	"os"
+
+	"github.com/glasskube/glasskube/internal/clientutils"
 
 	"github.com/fatih/color"
 	"github.com/glasskube/glasskube/api/v1alpha1"
 	"github.com/glasskube/glasskube/internal/cliutils"
 	"github.com/glasskube/glasskube/internal/manifestvalues/cli"
-	"github.com/glasskube/glasskube/internal/manifestvalues/flags"
 	"github.com/glasskube/glasskube/pkg/manifest"
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes/scheme"
-	"sigs.k8s.io/yaml"
 )
 
 var configureCmdOptions = struct {
-	flags.ValuesOptions
+	cli.ValuesOptions
 	OutputOptions
 	NamespaceOptions
 	KindOptions
 	DryRunOptions
 }{
-	ValuesOptions: flags.NewOptions(flags.WithKeepOldValuesFlag),
+	ValuesOptions: cli.NewOptions(cli.WithKeepOldValuesFlag),
 	KindOptions:   DefaultKindOptions(),
 }
 
 var configureCmd = &cobra.Command{
-	Use:               "configure <package-name>",
-	Short:             "Configure a package",
-	Args:              cobra.ExactArgs(1),
-	PreRun:            cliutils.SetupClientContext(true, &rootCmdOptions.SkipUpdateCheck),
-	Run:               runConfigure,
-	ValidArgsFunction: completeInstalledPackageNames,
+	Use:    "configure <package-name>",
+	Short:  "Configure a package",
+	Args:   cobra.ExactArgs(1),
+	PreRun: cliutils.SetupClientContext(true, &rootCmdOptions.SkipUpdateCheck),
+	Run:    runConfigure,
+	ValidArgsFunction: installedPackagesCompletionFunc(
+		&configureCmdOptions.NamespaceOptions,
+		&configureCmdOptions.KindOptions,
+	),
 }
 
 func runConfigure(cmd *cobra.Command, args []string) {
@@ -59,21 +60,27 @@ func runConfigure(cmd *cobra.Command, args []string) {
 		cliutils.ExitWithError()
 	}
 
+	pkgManifest, err := manifest.GetInstalledManifestForPackage(ctx, pkg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ error getting installed manifest: %v\n", err)
+		cliutils.ExitWithError()
+	}
+
 	if configureCmdOptions.IsValuesSet() {
-		if values, err := configureCmdOptions.ParseValues(pkg.GetSpec().Values); err != nil {
+		if values, err := configureCmdOptions.ParseValues(pkgManifest, pkg.GetSpec().Values); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ invalid values in command line flags: %v\n", err)
 			cliutils.ExitWithError()
 		} else {
 			pkg.GetSpec().Values = values
 		}
 	} else {
-		if pkgManifest, err := manifest.GetInstalledManifestForPackage(ctx, pkg); err != nil {
-			fmt.Fprintf(os.Stderr, "❌ error getting installed manifest: %v\n", err)
-			cliutils.ExitWithError()
-		} else if len(pkgManifest.ValueDefinitions) == 0 {
+		if len(pkgManifest.ValueDefinitions) == 0 {
 			fmt.Fprintln(os.Stderr, "❌ this package has no configuration values")
 			cliutils.ExitWithError()
-		} else if values, err := cli.Configure(*pkgManifest, pkg.GetSpec().Values); err != nil {
+		} else if values, err := cli.Configure(*pkgManifest,
+			cli.WithOldValues(pkg.GetSpec().Values),
+			cli.WithUseDefaults(configureCmdOptions.UseDefault),
+		); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ error during configure: %v\n", err)
 			cliutils.ExitWithError()
 		} else {
@@ -130,25 +137,13 @@ func runConfigure(cmd *cobra.Command, args []string) {
 	}
 
 	if configureCmdOptions.Output != "" {
-		if gvks, _, err := scheme.Scheme.ObjectKinds(pkg); err == nil && len(gvks) == 1 {
-			pkg.SetGroupVersionKind(gvks[0])
-		}
-		var output []byte
-		var err error
-		switch configureCmdOptions.Output {
-		case OutputFormatJSON:
-			output, err = json.MarshalIndent(pkg, "", "  ")
-		case OutputFormatYAML:
-			output, err = yaml.Marshal(pkg)
-		default:
-			fmt.Fprintf(os.Stderr, "❌ invalid output format: %s\n", configureCmdOptions.Output)
-			cliutils.ExitWithError()
-		}
-		if err != nil {
+		if out, err := clientutils.Format(configureCmdOptions.Output.OutputFormat(),
+			configureCmdOptions.ShowAll, pkg); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ error marshalling output: %v\n", err)
 			cliutils.ExitWithError()
+		} else {
+			fmt.Print(out)
 		}
-		fmt.Println(string(output))
 	}
 }
 

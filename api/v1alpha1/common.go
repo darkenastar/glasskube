@@ -1,20 +1,19 @@
 package v1alpha1
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"strconv"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-const (
-	autoUpdateAnnotation = "packages.glasskube.dev/auto-update"
-	dependencyAnnotation = "packages.glasskube.dev/installed-as-dependency"
-)
-
 func autoUpdatesEnabled(obj metav1.ObjectMeta) bool {
 	if obj.Annotations == nil {
 		return false
-	} else if enabledStr, ok := obj.Annotations[autoUpdateAnnotation]; !ok {
+	} else if enabledStr, ok := obj.Annotations[AnnotationAutoUpdate]; !ok {
 		return false
 	} else {
 		enabled, _ := strconv.ParseBool(enabledStr)
@@ -27,16 +26,16 @@ func setAutoUpdatesEnabled(obj *metav1.ObjectMeta, enabled bool) {
 		obj.Annotations = make(map[string]string)
 	}
 	if enabled {
-		obj.Annotations[autoUpdateAnnotation] = strconv.FormatBool(true)
+		obj.Annotations[AnnotationAutoUpdate] = strconv.FormatBool(true)
 	} else {
-		delete(obj.Annotations, autoUpdateAnnotation)
+		delete(obj.Annotations, AnnotationAutoUpdate)
 	}
 }
 
 func installedAsDependency(obj metav1.ObjectMeta) bool {
 	if obj.Annotations == nil {
 		return false
-	} else if enabledStr, ok := obj.Annotations[dependencyAnnotation]; !ok {
+	} else if enabledStr, ok := obj.Annotations[AnnotationInstalledAsDep]; !ok {
 		return false
 	} else {
 		enabled, _ := strconv.ParseBool(enabledStr)
@@ -49,9 +48,9 @@ func setInstalledAsDependency(obj *metav1.ObjectMeta, value bool) {
 		obj.Annotations = make(map[string]string)
 	}
 	if value {
-		obj.Annotations[dependencyAnnotation] = strconv.FormatBool(true)
+		obj.Annotations[AnnotationInstalledAsDep] = strconv.FormatBool(true)
 	} else {
-		delete(obj.Annotations, dependencyAnnotation)
+		delete(obj.Annotations, AnnotationInstalledAsDep)
 	}
 }
 
@@ -83,17 +82,35 @@ type ValueReference struct {
 	PackageRef   *PackageValueSource   `json:"packageRef,omitempty"`
 }
 
+type InlineValueConfiguration struct {
+	Value *string `json:"value,omitempty"`
+}
+
 // +kubebuilder:validation:MinProperties:=1
 // +kubebuilder:validation:MaxProperties:=1
 type ValueConfiguration struct {
-	Value     *string         `json:"value,omitempty"`
-	ValueFrom *ValueReference `json:"valueFrom,omitempty"`
+	InlineValueConfiguration `json:",inline"`
+	ValueFrom                *ValueReference `json:"valueFrom,omitempty"`
 }
 
 // PackageSpec defines the desired state
 type PackageSpec struct {
 	PackageInfo PackageInfoTemplate           `json:"packageInfo"`
 	Values      map[string]ValueConfiguration `json:"values,omitempty"`
+
+	// Suspend indicates that reconciliation of this resource should be suspended.
+	//
+	// +kubebuilder:validation:Optional
+	Suspend bool `json:"suspend"`
+}
+
+func (spec *PackageSpec) Hashed() (string, error) {
+	h := sha256.New()
+	if err := json.NewEncoder(h).Encode(spec); err != nil {
+		return "", fmt.Errorf("failed to encode package spec: %w", err)
+	} else {
+		return hex.EncodeToString(h.Sum(nil)), nil
+	}
 }
 
 // PackageStatus defines the observed state

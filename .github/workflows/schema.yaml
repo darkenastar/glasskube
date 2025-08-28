@@ -5,20 +5,20 @@ on:
     branches:
       - main
     paths:
-      - website/static/schemas/**
+      - schemas/**
   pull_request:
     branches:
       - main
     paths:
-      - website/static/schemas/**
+      - schemas/**
 
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - name: Validate Package Manifest Schema
         uses: cardinalby/schema-validator-action@v3
         with:
           file: "test/package-manifest/example.yaml"
-          schema: "./website/static/schemas/v1/package-manifest.json"
+          schema: "./schemas/v1/package-manifest.json"

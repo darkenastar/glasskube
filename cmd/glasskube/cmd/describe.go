@@ -9,6 +9,8 @@ import (
 	"os"
 	"strings"
 
+	repoerror "github.com/glasskube/glasskube/internal/repo/error"
+
 	"github.com/fatih/color"
 	"github.com/glasskube/glasskube/api/v1alpha1"
 	"github.com/glasskube/glasskube/internal/clientutils"
@@ -17,13 +19,15 @@ import (
 	"github.com/glasskube/glasskube/internal/manifestvalues"
 	repoclient "github.com/glasskube/glasskube/internal/repo/client"
 	"github.com/glasskube/glasskube/internal/semver"
+	"github.com/glasskube/glasskube/internal/util"
 	"github.com/glasskube/glasskube/pkg/client"
 	"github.com/glasskube/glasskube/pkg/condition"
 	"github.com/glasskube/glasskube/pkg/describe"
 	"github.com/spf13/cobra"
 	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/extension"
 	"github.com/yuin/goldmark/renderer"
-	"github.com/yuin/goldmark/util"
+	goldmarkutil "github.com/yuin/goldmark/util"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/yaml"
 )
@@ -62,7 +66,9 @@ var describeCmd = &cobra.Command{
 				// package not installed -> use latest manifest from repo
 				if lvErr != nil {
 					fmt.Fprintf(os.Stderr, "❌ Could not get latest info for %v: %v\n", pkgName, lvErr)
-					cliutils.ExitWithError()
+					if repoerror.IsComplete(lvErr) {
+						cliutils.ExitWithError()
+					}
 				}
 
 				manifest = latestManifest
@@ -121,14 +127,13 @@ var describeCmd = &cobra.Command{
 		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Could not get repos for %v: %v\n", pkgName, err)
-			cliutils.ExitWithError()
 		}
 
 		bold := color.New(color.Bold).SprintFunc()
 
-		if describeCmdOptions.Output == OutputFormatJSON {
+		if describeCmdOptions.Output == outputFormatJSON {
 			printJSON(ctx, pkg, pkgs, manifest, latestVersion, repos)
-		} else if describeCmdOptions.Output == OutputFormatYAML {
+		} else if describeCmdOptions.Output == outputFormatYAML {
 			printYAML(ctx, pkg, pkgs, manifest, latestVersion, repos)
 		} else {
 			fmt.Println(bold("Package:"), nameAndDescription(manifest))
@@ -140,6 +145,7 @@ var describeCmd = &cobra.Command{
 				fmt.Println(bold("Status:     "), status(pkgStatus))
 				fmt.Println(bold("Message:    "), message(pkgStatus))
 				fmt.Println(bold("Auto-Update:"), clientutils.AutoUpdateString(pkg, "Disabled"))
+				fmt.Println(bold("Suspended:  "), boolYesNo(pkg.GetSpec().Suspend))
 			} else if len(pkgs) > 0 {
 				fmt.Println()
 				fmt.Println(bold("Instances:"))
@@ -152,6 +158,7 @@ var describeCmd = &cobra.Command{
 					fmt.Println(bold("    Status:     "), status(pkgStatus))
 					fmt.Println(bold("    Message:    "), message(pkgStatus))
 					fmt.Println(bold("    Auto-Update:"), clientutils.AutoUpdateString(&pkg, "Disabled"))
+					fmt.Println(bold("    Suspended:  "), boolYesNo(pkg.Spec.Suspend))
 				}
 			}
 
@@ -165,6 +172,12 @@ var describeCmd = &cobra.Command{
 				fmt.Println()
 				fmt.Println(bold("Dependencies:"))
 				printDependencies(manifest)
+			}
+
+			if len(manifest.Components) > 0 {
+				fmt.Println()
+				fmt.Println(bold("Components:"))
+				printComponents(manifest)
 			}
 
 			fmt.Println()
@@ -223,6 +236,16 @@ func printDependencies(manifest *v1alpha1.PackageManifest) {
 		fmt.Printf(" * %v", dep.Name)
 		if len(dep.Version) > 0 {
 			fmt.Printf(" (%v)", dep.Version)
+		}
+		fmt.Println()
+	}
+}
+
+func printComponents(manifest *v1alpha1.PackageManifest) {
+	for _, cmp := range manifest.Components {
+		fmt.Printf(" * %v", cmp.Name)
+		if len(cmp.Version) > 0 {
+			fmt.Printf(" (%v)", cmp.Version)
 		}
 		fmt.Println()
 	}
@@ -299,24 +322,34 @@ func referencesAsMap(
 
 func printValueConfigurations(w io.Writer, values map[string]v1alpha1.ValueConfiguration) {
 	for name, value := range values {
-		fmt.Fprintf(w, " * %v: %v\n", name, manifestvalues.ValueAsString(value))
+		util.Must(fmt.Fprintf(w, " * %v: %v\n", name, manifestvalues.ValueAsString(value)))
 	}
 }
 
 func printMarkdown(w io.Writer, text string) {
 	md := goldmark.New(
+		goldmark.WithExtensions(
+			extension.Linkify,
+		),
 		goldmark.WithRenderer(renderer.NewRenderer(
 			renderer.WithNodeRenderers(
-				util.Prioritized(cliutils.MarkdownRenderer(), 1000),
+				goldmarkutil.Prioritized(cliutils.MarkdownRenderer(), 1000),
 			),
 		)),
 	)
 	var buf bytes.Buffer
 	if err := md.Convert([]byte(text), &buf); err != nil {
-		fmt.Fprintln(w, text)
+		util.Must(fmt.Fprintln(w, text))
 	} else {
-		fmt.Fprintln(w, strings.TrimSpace(buf.String()))
+		util.Must(fmt.Fprintln(w, strings.TrimSpace(buf.String())))
 	}
+}
+
+func boolYesNo(value bool) string {
+	if value {
+		return "Yes"
+	}
+	return "No"
 }
 
 func status(pkgStatus *client.PackageStatus) string {
@@ -388,6 +421,7 @@ func createOutputStructure(
 		"status":           "Not Installed",
 		"entrypoints":      manifest.Entrypoints,
 		"dependencies":     manifest.Dependencies,
+		"components":       manifest.Components,
 		"longDescription":  strings.TrimSpace(manifest.LongDescription),
 		"repositories":     repositoriesAsMap(pkg, repos),
 		"references":       referencesAsMap(ctx, pkg, manifest),
@@ -399,6 +433,7 @@ func createOutputStructure(
 		data["autoUpdate"] = pkg.AutoUpdatesEnabled()
 		data["isUpgradable"] = semver.IsUpgradable(pkg.GetSpec().PackageInfo.Version, latestVersion)
 		data["status"] = client.GetStatusOrPending(pkg).Status
+		data["suspend"] = pkg.GetSpec().Suspend
 	}
 	if len(instances) > 0 {
 		data["instances"] = instances
